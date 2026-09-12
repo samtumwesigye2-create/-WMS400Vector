@@ -151,7 +151,7 @@ def test_material_issue_requires_released_order_and_is_idempotent(client):
             "correlation_id": "CORR-2001",
             "bom_base_quantity": 1,
             "components": [
-                {"material_code": "RM-A", "quantity": 5, "location_code": "RM-01"},
+                {"material_code": "RM-A", "quantity": 0.5, "location_code": "RM-01"},
             ],
         },
         headers=headers(),

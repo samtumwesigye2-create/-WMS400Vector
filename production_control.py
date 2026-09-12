@@ -49,6 +49,25 @@ class ProductionActionIn(BaseModel):
     correlation_id: str = Field(min_length=1, max_length=160)
 
 
+class ProductionBomComponentIn(BaseModel):
+    material_code: str = Field(min_length=1, max_length=160)
+    quantity: float = Field(gt=0)
+    location_code: str = Field(min_length=1, max_length=160)
+
+
+class ProductionReservationIn(BaseModel):
+    transaction_id: str = Field(min_length=1, max_length=160)
+    correlation_id: str = Field(min_length=1, max_length=160)
+    bom_base_quantity: float = Field(gt=0)
+    components: list[ProductionBomComponentIn] = Field(min_length=1)
+
+
+class ProductionMaterialIssueIn(BaseModel):
+    transaction_id: str = Field(min_length=1, max_length=160)
+    correlation_id: str = Field(min_length=1, max_length=160)
+    reservation_code: str = Field(min_length=1, max_length=200)
+
+
 def init_production_control(conn) -> None:
     with conn() as c:
         c.execute(
@@ -170,6 +189,27 @@ def _serialize_order(row) -> dict:
     }
 
 
+def _inventory_status_locked(c, sku: str, location_code: str):
+    row = c.execute(
+        "SELECT * FROM vector_inventory_status WHERE sku=%s AND location_code=%s FOR UPDATE",
+        (sku, location_code),
+    ).fetchone()
+    if not row:
+        c.execute(
+            "INSERT INTO vector_inventory_status(sku,location_code,reserved,quarantine,damaged,updated_at) VALUES(%s,%s,0,0,0,%s)",
+            (sku, location_code, now()),
+        )
+        row = c.execute(
+            "SELECT * FROM vector_inventory_status WHERE sku=%s AND location_code=%s FOR UPDATE",
+            (sku, location_code),
+        ).fetchone()
+    return row
+
+
+def _available_quantity(inv, stat) -> int:
+    return int(inv["quantity"]) - int(stat["reserved"]) - int(stat["quarantine"]) - int(stat["damaged"])
+
+
 def install_production_routes(app, conn, auth) -> None:
     @router.post("/orders", status_code=201)
     def create_order(body: ProductionOrderIn, authorization: str | None = Header(None)):
@@ -266,6 +306,179 @@ def install_production_routes(app, conn, auth) -> None:
                 transaction_id=body.transaction_id,
                 production_order_id=production_order_id,
                 ucode="U-PP-002",
+                correlation_id=body.correlation_id,
+                result=result,
+            )
+            return result
+
+    @router.post("/orders/{production_order_id}/reservations", status_code=201)
+    def reserve_materials(production_order_id: str, body: ProductionReservationIn, authorization: str | None = Header(None)):
+        auth("vector.production.write", authorization)
+        with conn() as c:
+            existing = _idempotent_result(c, body.transaction_id)
+            if existing is not None:
+                return existing
+            order = c.execute(
+                "SELECT * FROM vector_production_orders WHERE production_order_id=%s FOR UPDATE",
+                (production_order_id,),
+            ).fetchone()
+            if not order:
+                raise HTTPException(404, "production_order_not_found")
+            if order["status"] not in {"RELEASED", "IN_PROGRESS"}:
+                raise HTTPException(409, "production_order_not_released")
+
+            prepared = []
+            for line_number, component in enumerate(body.components, start=1):
+                required = float(component.quantity) * float(order["planned_quantity"]) / float(body.bom_base_quantity)
+                rounded = round(required)
+                if abs(required - rounded) > 1e-9:
+                    raise HTTPException(400, "fractional_reservation_quantity_unsupported")
+                required_quantity = int(rounded)
+                inv = c.execute(
+                    "SELECT id,quantity FROM vector_inventory WHERE sku=%s AND location_code=%s FOR UPDATE",
+                    (component.material_code, component.location_code),
+                ).fetchone()
+                if not inv:
+                    raise HTTPException(409, "insufficient_available_inventory")
+                stat = _inventory_status_locked(c, component.material_code, component.location_code)
+                if _available_quantity(inv, stat) < required_quantity:
+                    raise HTTPException(409, "insufficient_available_inventory")
+                prepared.append((line_number, component, required_quantity))
+
+            reservations = []
+            ts = now()
+            for line_number, component, required_quantity in prepared:
+                reservation_code = f"PROD-{production_order_id}-{line_number:03d}"
+                c.execute(
+                    "UPDATE vector_inventory_status SET reserved=reserved+%s,updated_at=%s WHERE sku=%s AND location_code=%s",
+                    (required_quantity, ts, component.material_code, component.location_code),
+                )
+                row = c.execute(
+                    """INSERT INTO vector_reservations
+                    (id,reservation_code,sku,location_code,quantity,status,reference,created_at,updated_at)
+                    VALUES(%s,%s,%s,%s,%s,'active',%s,%s,%s) RETURNING *""",
+                    (
+                        str(uuid4()), reservation_code, component.material_code,
+                        component.location_code, required_quantity, production_order_id, ts, ts,
+                    ),
+                ).fetchone()
+                reservations.append({
+                    "reservation_code": row["reservation_code"],
+                    "sku": row["sku"],
+                    "location_code": row["location_code"],
+                    "quantity": int(row["quantity"]),
+                    "status": row["status"],
+                    "reference": row["reference"],
+                })
+
+            result = {
+                "production_order_id": production_order_id,
+                "correlation_id": body.correlation_id,
+                "reservations": reservations,
+            }
+            _audit(
+                c,
+                production_order_id=production_order_id,
+                transaction_id=body.transaction_id,
+                correlation_id=body.correlation_id,
+                action="U-PP-003",
+                from_status=order["status"],
+                to_status=order["status"],
+                payload=body.model_dump(),
+            )
+            _store_transaction(
+                c,
+                transaction_id=body.transaction_id,
+                production_order_id=production_order_id,
+                ucode="U-PP-003",
+                correlation_id=body.correlation_id,
+                result=result,
+            )
+            return result
+
+    @router.post("/orders/{production_order_id}/material-issues")
+    def issue_material(production_order_id: str, body: ProductionMaterialIssueIn, authorization: str | None = Header(None)):
+        auth("vector.production.write", authorization)
+        with conn() as c:
+            existing = _idempotent_result(c, body.transaction_id)
+            if existing is not None:
+                return existing
+            order = c.execute(
+                "SELECT * FROM vector_production_orders WHERE production_order_id=%s FOR UPDATE",
+                (production_order_id,),
+            ).fetchone()
+            if not order:
+                raise HTTPException(404, "production_order_not_found")
+            if order["status"] not in {"RELEASED", "IN_PROGRESS"}:
+                raise HTTPException(409, "production_order_not_released")
+            reservation = c.execute(
+                "SELECT * FROM vector_reservations WHERE reservation_code=%s FOR UPDATE",
+                (body.reservation_code,),
+            ).fetchone()
+            if not reservation:
+                raise HTTPException(404, "reservation_not_found")
+            if reservation["reference"] != production_order_id:
+                raise HTTPException(409, "reservation_order_mismatch")
+            if reservation["status"] != "active":
+                raise HTTPException(409, "reservation_not_active")
+
+            inv = c.execute(
+                "SELECT id,quantity FROM vector_inventory WHERE sku=%s AND location_code=%s FOR UPDATE",
+                (reservation["sku"], reservation["location_code"]),
+            ).fetchone()
+            if not inv or int(inv["quantity"]) < int(reservation["quantity"]):
+                raise HTTPException(409, "insufficient_inventory")
+            stat = _inventory_status_locked(c, reservation["sku"], reservation["location_code"])
+            if int(stat["reserved"]) < int(reservation["quantity"]):
+                raise HTTPException(409, "reservation_balance_invalid")
+
+            ts = now()
+            quantity = int(reservation["quantity"])
+            c.execute(
+                "UPDATE vector_inventory_status SET reserved=reserved-%s,updated_at=%s WHERE sku=%s AND location_code=%s",
+                (quantity, ts, reservation["sku"], reservation["location_code"]),
+            )
+            c.execute(
+                "UPDATE vector_inventory SET quantity=quantity-%s,updated_at=%s WHERE id=%s",
+                (quantity, ts, inv["id"]),
+            )
+            c.execute(
+                "UPDATE vector_reservations SET status='consumed',updated_at=%s WHERE id=%s",
+                (ts, reservation["id"]),
+            )
+            movement = c.execute(
+                """INSERT INTO vector_movements
+                (id,sku,quantity,movement_type,from_location,to_location,reference,created_at)
+                VALUES(%s,%s,%s,'production_issue',%s,NULL,%s,%s) RETURNING *""",
+                (
+                    str(uuid4()), reservation["sku"], quantity,
+                    reservation["location_code"], production_order_id, ts,
+                ),
+            ).fetchone()
+            result = {
+                "production_order_id": production_order_id,
+                "reservation_code": body.reservation_code,
+                "sku": reservation["sku"],
+                "quantity": quantity,
+                "movement_type": movement["movement_type"],
+                "status": "consumed",
+                "correlation_id": body.correlation_id,
+            }
+            _audit(
+                c,
+                production_order_id=production_order_id,
+                transaction_id=body.transaction_id,
+                correlation_id=body.correlation_id,
+                action="U-PP-004",
+                from_status=order["status"],
+                to_status=order["status"],
+                payload=body.model_dump(),
+            )
+            _store_transaction(
+                c,
+                transaction_id=body.transaction_id,
+                production_order_id=production_order_id,
+                ucode="U-PP-004",
                 correlation_id=body.correlation_id,
                 result=result,
             )

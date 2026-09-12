@@ -12,6 +12,7 @@ from psycopg.rows import dict_row
 from inventory_control import init_inventory_control
 from production_control import init_production_control, install_production_routes
 from production_execution import install_production_execution_routes
+from production_reporting import install_production_reporting_routes
 
 
 def db_conn():
@@ -32,6 +33,7 @@ def client():
     init_inventory_control(db_conn)
     init_production_control(db_conn)
     app = FastAPI()
+    install_production_reporting_routes(app, db_conn, allow_auth)
     install_production_routes(app, db_conn, allow_auth)
     install_production_execution_routes(app, db_conn, allow_auth)
     return TestClient(app)

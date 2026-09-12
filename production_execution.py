@@ -174,7 +174,7 @@ def install_production_execution_routes(app, conn, auth) -> None:
             ).fetchone()
             if not order:
                 raise HTTPException(404, "production_order_not_found")
-            if order["status"] not in {"IN_PROGRESS", "COMPLETED"}:
+            if order["status"] not in {"RELEASED", "IN_PROGRESS", "COMPLETED"}:
                 raise HTTPException(409, "production_order_not_in_progress")
 
             new_received = float(order["received_quantity"]) + float(body.quantity)

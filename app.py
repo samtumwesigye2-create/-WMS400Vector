@@ -10,6 +10,7 @@ from valuation_audit import init_valuation_audit, install_valuation_audit_routes
 from traceability import init_traceability, install_traceability_routes
 from production_control import init_production_control, install_production_routes
 from production_execution import install_production_execution_routes
+from production_reporting import install_production_reporting_routes
 
 app=FastAPI(title='UNG-VECTOR',version='0.8.0')
 DB=os.getenv('DATABASE_URL','')
@@ -58,7 +59,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS_BASE_URL}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS_BASE_URL}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','inventory-valuation','immutable-audit-ledger','midas-outbox','batch-lot-tracking','serial-tracking','expiration-tracking','traceability','recalls','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','production-orders','production-trace','operation-confirmation','scrap-rework','finished-goods-receipt','production-close','janus-bearer-auth']}
+def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','inventory-valuation','immutable-audit-ledger','midas-outbox','batch-lot-tracking','serial-tracking','expiration-tracking','traceability','recalls','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','production-orders','production-status','production-trace','operation-confirmation','scrap-rework','finished-goods-receipt','production-close','janus-bearer-auth']}
 @app.get('/v1/locations')
 def locations(authorization:str|None=Header(None)):
  auth('vector.locations.read',authorization)
@@ -115,5 +116,6 @@ install_material_routes(app, conn, auth)
 install_inventory_control_routes(app, conn, auth)
 install_valuation_audit_routes(app, conn, auth)
 install_traceability_routes(app, conn, auth)
+install_production_reporting_routes(app, conn, auth)
 install_production_routes(app, conn, auth)
 install_production_execution_routes(app, conn, auth)

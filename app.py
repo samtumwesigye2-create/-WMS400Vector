@@ -8,8 +8,9 @@ from material_master import init_material_master, install_material_routes
 from inventory_control import init_inventory_control, install_inventory_control_routes
 from valuation_audit import init_valuation_audit, install_valuation_audit_routes
 from traceability import init_traceability, install_traceability_routes
+from production_control import init_production_control, install_production_routes
 
-app=FastAPI(title='UNG-VECTOR',version='0.6.1')
+app=FastAPI(title='UNG-VECTOR',version='0.7.0')
 DB=os.getenv('DATABASE_URL','')
 JANUS_BASE_URL=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
 def now(): return datetime.now(timezone.utc)
@@ -39,15 +40,16 @@ def init_db():
  init_inventory_control(conn)
  init_valuation_audit(conn)
  init_traceability(conn)
+ init_production_control(conn)
 @app.on_event('startup')
 def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
 class InventoryIn(BaseModel):sku:str;description:str;quantity:int;location_code:str
 class MovementIn(BaseModel):sku:str;quantity:int;movement_type:str;from_location:str|None=None;to_location:str|None=None;reference:str|None=None
 @app.get('/')
-def root():return {'system':'UNG-VECTOR','domain':'warehouse-logistics','status':'online','version':'0.6.1'}
+def root():return {'system':'UNG-VECTOR','domain':'warehouse-logistics','status':'online','version':'0.7.0'}
 @app.get('/health')
-def health():return {'status':'ok','service':'UNG-VECTOR','version':'0.6.1'}
+def health():return {'status':'ok','service':'UNG-VECTOR','version':'0.7.0'}
 @app.get('/ready')
 def ready():
  try:
@@ -55,7 +57,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS_BASE_URL}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS_BASE_URL}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','inventory-valuation','immutable-audit-ledger','midas-outbox','batch-lot-tracking','serial-tracking','expiration-tracking','traceability','recalls','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','janus-bearer-auth']}
+def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','inventory-valuation','immutable-audit-ledger','midas-outbox','batch-lot-tracking','serial-tracking','expiration-tracking','traceability','recalls','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','production-orders','production-trace','janus-bearer-auth']}
 @app.get('/v1/locations')
 def locations(authorization:str|None=Header(None)):
  auth('vector.locations.read',authorization)
@@ -112,3 +114,4 @@ install_material_routes(app, conn, auth)
 install_inventory_control_routes(app, conn, auth)
 install_valuation_audit_routes(app, conn, auth)
 install_traceability_routes(app, conn, auth)
+install_production_routes(app, conn, auth)

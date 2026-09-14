@@ -44,7 +44,7 @@ def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
 class InventoryIn(BaseModel):sku:str;description:str;quantity:int;location_code:str
 class MovementIn(BaseModel):sku:str;quantity:int;movement_type:str;from_location:str|None=None;to_location:str|None=None;reference:str|None=None
-@app.get('/')
+@app.get('/api/status')
 def root():return {'system':'UNG-VECTOR','domain':'warehouse-logistics','status':'online','version':'0.6.1'}
 @app.get('/health')
 def health():return {'status':'ok','service':'UNG-VECTOR','version':'0.6.1'}
@@ -112,3 +112,7 @@ install_material_routes(app, conn, auth)
 install_inventory_control_routes(app, conn, auth)
 install_valuation_audit_routes(app, conn, auth)
 install_traceability_routes(app, conn, auth)
+
+from pathlib import Path
+from ui_portal import install_ui
+install_ui(app, Path(__file__).with_name('ui') / 'index.html', JANUS_BASE_URL)

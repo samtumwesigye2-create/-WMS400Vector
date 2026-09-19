@@ -113,6 +113,7 @@ def move(b:MovementIn,authorization:str|None=Header(None)):
   else:
    row=c.execute('SELECT id,quantity FROM vector_inventory WHERE sku=%s AND location_code=%s FOR UPDATE',(b.sku,b.from_location)).fetchone()
    if not row:raise HTTPException(404,'inventory_not_found')
+   adjustment_delta=b.quantity-row['quantity']
    c.execute('UPDATE vector_inventory SET quantity=%s,updated_at=%s WHERE id=%s',(b.quantity,now(),row['id']))
   movement=c.execute('INSERT INTO vector_movements VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(str(uuid4()),b.sku,b.quantity,b.movement_type,b.from_location,b.to_location,b.reference,now())).fetchone()
  location=b.to_location if b.movement_type=='receive' else b.from_location
@@ -121,7 +122,7 @@ def move(b:MovementIn,authorization:str|None=Header(None)):
  if b.movement_type=='transfer':
   events=[inventory_changed(b.sku,b.from_location,-b.quantity,'transfer_out',b.reference or ''),inventory_changed(b.sku,b.to_location,b.quantity,'transfer_in',b.reference or '')]
  elif b.movement_type=='adjust':
-  events=[inventory_changed(b.sku,b.from_location,b.quantity,'adjustment_absolute_balance',b.reference or '')]
+  events=[inventory_changed(b.sku,b.from_location,adjustment_delta,'adjust',b.reference or '')]
  else:
   events=[inventory_changed(b.sku,location,delta,b.movement_type,b.reference or '')]
  deliveries=[emit(e['target_system'],e['message_type'],e['payload']) for e in events]

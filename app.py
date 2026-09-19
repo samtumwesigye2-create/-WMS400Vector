@@ -8,6 +8,7 @@ from material_master import init_material_master, install_material_routes
 from inventory_control import init_inventory_control, install_inventory_control_routes
 from valuation_audit import init_valuation_audit, install_valuation_audit_routes
 from traceability import init_traceability, install_traceability_routes
+from integration_events import inventory_changed
 
 app=FastAPI(title='UNG-VECTOR',version='0.6.1')
 DB=os.getenv('DATABASE_URL','')
@@ -113,7 +114,18 @@ def move(b:MovementIn,authorization:str|None=Header(None)):
    row=c.execute('SELECT id,quantity FROM vector_inventory WHERE sku=%s AND location_code=%s FOR UPDATE',(b.sku,b.from_location)).fetchone()
    if not row:raise HTTPException(404,'inventory_not_found')
    c.execute('UPDATE vector_inventory SET quantity=%s,updated_at=%s WHERE id=%s',(b.quantity,now(),row['id']))
-  return c.execute('INSERT INTO vector_movements VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(str(uuid4()),b.sku,b.quantity,b.movement_type,b.from_location,b.to_location,b.reference,now())).fetchone()
+  movement=c.execute('INSERT INTO vector_movements VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(str(uuid4()),b.sku,b.quantity,b.movement_type,b.from_location,b.to_location,b.reference,now())).fetchone()
+ location=b.to_location if b.movement_type=='receive' else b.from_location
+ delta=b.quantity if b.movement_type=='receive' else (-b.quantity if b.movement_type=='dispatch' else 0)
+ events=[]
+ if b.movement_type=='transfer':
+  events=[inventory_changed(b.sku,b.from_location,-b.quantity,'transfer_out',b.reference or ''),inventory_changed(b.sku,b.to_location,b.quantity,'transfer_in',b.reference or '')]
+ elif b.movement_type=='adjust':
+  events=[inventory_changed(b.sku,b.from_location,b.quantity,'adjustment_absolute_balance',b.reference or '')]
+ else:
+  events=[inventory_changed(b.sku,location,delta,b.movement_type,b.reference or '')]
+ deliveries=[emit(e['target_system'],e['message_type'],e['payload']) for e in events]
+ return {'movement':movement,'integration_events':events,'integration_delivery':deliveries}
 @app.get('/v1/summary')
 def summary(authorization:str|None=Header(None)):
  auth('vector.inventory.read',authorization)

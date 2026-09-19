@@ -12,7 +12,18 @@ from traceability import init_traceability, install_traceability_routes
 app=FastAPI(title='UNG-VECTOR',version='0.6.1')
 DB=os.getenv('DATABASE_URL','')
 JANUS_BASE_URL=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
+NEXUS_BASE_URL=os.getenv('NEXUS_BASE_URL','https://ung-nexus-production.up.railway.app').rstrip('/')
+VECTOR_SERVICE_TOKEN=os.getenv('UNG_VECTOR_SERVICE_TOKEN','').strip()
 def now(): return datetime.now(timezone.utc)
+def emit(target,message_type,payload):
+ if not NEXUS_BASE_URL:return {'status':'disabled'}
+ if not VECTOR_SERVICE_TOKEN:return {'status':'failed','error':'vector_service_token_missing'}
+ body=json.dumps({'source_system':'UNG-VECTOR','target_system':target,'message_type':message_type,'payload':payload}).encode()
+ req=urllib.request.Request(NEXUS_BASE_URL+'/v1/messages',data=body,method='POST',headers={'Authorization':f'Bearer {VECTOR_SERVICE_TOKEN}','Content-Type':'application/json','User-Agent':'UNG-VECTOR/0.6.1'})
+ try:
+  with urllib.request.urlopen(req,timeout=8) as r:return {'status':'delivered','response_code':r.status,'response':json.loads(r.read().decode() or '{}')}
+ except urllib.error.HTTPError as e:return {'status':'failed','response_code':e.code,'error':f'http_{e.code}'}
+ except Exception as e:return {'status':'failed','error':type(e).__name__}
 def auth(permission,authorization):
  if not authorization or not authorization.lower().startswith('bearer '): raise HTTPException(401,'JANUS bearer token required')
  req=urllib.request.Request(JANUS_BASE_URL+'/v1/auth/introspect',data=b'',method='POST',headers={'Authorization':authorization})
@@ -109,7 +120,7 @@ def summary(authorization:str|None=Header(None)):
  with conn() as c:return {'distinct_skus':c.execute('SELECT count(DISTINCT sku) n FROM vector_inventory').fetchone()['n'],'units_on_hand':c.execute('SELECT COALESCE(sum(quantity),0) n FROM vector_inventory').fetchone()['n'],'movements':c.execute('SELECT count(*) n FROM vector_movements').fetchone()['n'],'generated_at':now()}
 
 install_material_routes(app, conn, auth)
-install_inventory_control_routes(app, conn, auth)
+install_inventory_control_routes(app, conn, auth, emit)
 install_valuation_audit_routes(app, conn, auth)
 install_traceability_routes(app, conn, auth)
 

@@ -80,7 +80,11 @@ def _available(inv, stat):
     return inv['quantity'] - stat['reserved'] - stat['quarantine'] - stat['damaged']
 
 
-def install_inventory_control_routes(app, conn, auth):
+def install_inventory_control_routes(app, conn, auth, emit=None):
+    def publish(events):
+        if not isinstance(events,list): events=[events]
+        if not emit: return [{"status":"disabled"} for _ in events]
+        return [emit(e["target_system"],e["message_type"],e["payload"]) for e in events]
     @router.get('/balances')
     def balances(authorization: str | None = Header(None)):
         auth('vector.inventory.read', authorization)
@@ -116,7 +120,8 @@ def install_inventory_control_routes(app, conn, auth):
                 row=c.execute('''INSERT INTO vector_reservations
                   VALUES(%s,%s,%s,%s,%s,'active',%s,%s,%s) RETURNING *''',
                   (str(uuid4()),b.reservation_code,b.sku,b.location_code,b.quantity,b.reference,t,t)).fetchone()
-                return {'reservation':row,'integration_event':reservation_changed(row)}
+                event=reservation_changed(row)
+                return {'reservation':row,'integration_event':event,'integration_delivery':publish(event)}
             except Exception as e:
                 if 'unique' in str(e).lower(): raise HTTPException(409,'reservation_already_exists')
                 raise
@@ -143,7 +148,7 @@ def install_inventory_control_routes(app, conn, auth):
                              ('consumed' if b.action=='consume' else 'released',t,r['id'])).fetchone()
             events=[reservation_changed(row)]
             if b.action=='consume': events.append(inventory_changed(row['sku'],row['location_code'],-row['quantity'],'reservation_consumed',row.get('reference') or ''))
-            return {'reservation':row,'integration_events':events}
+            return {'reservation':row,'integration_events':events,'integration_delivery':publish(events)}
 
     @router.post('/stock-status', status_code=201)
     def change_stock_status(b: StockStatusChange, authorization: str | None = Header(None)):
@@ -165,7 +170,8 @@ def install_inventory_control_routes(app, conn, auth):
                 c.execute(f'UPDATE vector_inventory_status SET {source}={source}-%s,updated_at=%s WHERE sku=%s AND location_code=%s',
                           (b.quantity,t,b.sku,b.location_code))
             row=c.execute('SELECT * FROM vector_inventory_status WHERE sku=%s AND location_code=%s',(b.sku,b.location_code)).fetchone()
-            return {'sku':b.sku,'location_code':b.location_code,'status':row,'reference':b.reference,'integration_event':inventory_changed(b.sku,b.location_code,0,'stock_status_'+b.target_status,b.reference or '')}
+            event=inventory_changed(b.sku,b.location_code,0,'stock_status_'+b.target_status,b.reference or '')
+            return {'sku':b.sku,'location_code':b.location_code,'status':row,'reference':b.reference,'integration_event':event,'integration_delivery':publish(event)}
 
     @router.get('/transit')
     def transit_list(authorization: str | None = Header(None)):
@@ -189,7 +195,8 @@ def install_inventory_control_routes(app, conn, auth):
                 row=c.execute('''INSERT INTO vector_stock_transit
                   VALUES(%s,%s,%s,%s,%s,%s,'in_transit',%s,%s,%s) RETURNING *''',
                   (str(uuid4()),b.transit_code,b.sku,b.quantity,b.from_location,b.to_location,b.reference,t,t)).fetchone()
-                return {'transit':row,'integration_events':[transit_changed(row),inventory_changed(b.sku,b.from_location,-b.quantity,'transit_started',b.reference or '')]}
+                events=[transit_changed(row),inventory_changed(b.sku,b.from_location,-b.quantity,'transit_started',b.reference or '')]
+                return {'transit':row,'integration_events':events,'integration_delivery':publish(events)}
             except Exception as e:
                 if 'unique' in str(e).lower(): raise HTTPException(409,'transit_already_exists')
                 raise
@@ -212,6 +219,7 @@ def install_inventory_control_routes(app, conn, auth):
             row=c.execute('UPDATE vector_stock_transit SET status=%s,updated_at=%s WHERE id=%s RETURNING *',
                              ('received' if b.action=='receive' else 'cancelled',t,tr['id'])).fetchone()
             reason='transit_received' if b.action=='receive' else 'transit_cancelled'
-            return {'transit':row,'integration_events':[transit_changed(row),inventory_changed(row['sku'],target,row['quantity'],reason,row.get('reference') or '')]}
+            events=[transit_changed(row),inventory_changed(row['sku'],target,row['quantity'],reason,row.get('reference') or '')]
+            return {'transit':row,'integration_events':events,'integration_delivery':publish(events)}
 
     app.include_router(router)

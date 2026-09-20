@@ -13,7 +13,7 @@ from manufacturing_planning import init_manufacturing, install_manufacturing_rou
 from capacity_planning import install_crp_routes
 from transportation_management import init_transportation, install_transportation_routes
 from enterprise_suite import init_enterprise_suite, install_enterprise_suite_routes
-from advanced_operations import init_advanced_ops, install_advanced_ops_routes
+from advanced_operations import init_advanced_ops, install_advanced_ops_routes\nfrom acceptance_test import install_acceptance_routes
 
 app=FastAPI(title='UNG-VECTOR',version='0.9.0')
 DB=os.getenv('DATABASE_URL','')
@@ -149,7 +149,7 @@ install_manufacturing_routes(app, conn, auth)
 install_crp_routes(app, conn, auth)
 install_transportation_routes(app, conn, auth)
 install_enterprise_suite_routes(app, conn, auth)
-install_advanced_ops_routes(app, conn, auth)
+install_advanced_ops_routes(app, conn, auth)\ninstall_acceptance_routes(app, conn, auth)
 
 from pathlib import Path
 from ui_portal import install_ui

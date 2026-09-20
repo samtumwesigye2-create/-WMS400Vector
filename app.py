@@ -9,8 +9,9 @@ from inventory_control import init_inventory_control, install_inventory_control_
 from valuation_audit import init_valuation_audit, install_valuation_audit_routes
 from traceability import init_traceability, install_traceability_routes
 from integration_events import inventory_changed
+from manufacturing_planning import init_manufacturing, install_manufacturing_routes
 
-app=FastAPI(title='UNG-VECTOR',version='0.6.1')
+app=FastAPI(title='UNG-VECTOR',version='0.7.0')
 DB=os.getenv('DATABASE_URL','')
 JANUS_BASE_URL=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
 NEXUS_BASE_URL=os.getenv('NEXUS_BASE_URL','https://ung-nexus-production.up.railway.app').rstrip('/')
@@ -20,7 +21,7 @@ def emit(target,message_type,payload):
  if not NEXUS_BASE_URL:return {'status':'disabled'}
  if not VECTOR_SERVICE_TOKEN:return {'status':'failed','error':'vector_service_token_missing'}
  body=json.dumps({'source_system':'UNG-VECTOR','target_system':target,'message_type':message_type,'payload':payload}).encode()
- req=urllib.request.Request(NEXUS_BASE_URL+'/v1/messages',data=body,method='POST',headers={'Authorization':f'Bearer {VECTOR_SERVICE_TOKEN}','Content-Type':'application/json','User-Agent':'UNG-VECTOR/0.6.1'})
+ req=urllib.request.Request(NEXUS_BASE_URL+'/v1/messages',data=body,method='POST',headers={'Authorization':f'Bearer {VECTOR_SERVICE_TOKEN}','Content-Type':'application/json','User-Agent':'UNG-VECTOR/0.7.0'})
  try:
   with urllib.request.urlopen(req,timeout=8) as r:return {'status':'delivered','response_code':r.status,'response':json.loads(r.read().decode() or '{}')}
  except urllib.error.HTTPError as e:return {'status':'failed','response_code':e.code,'error':f'http_{e.code}'}
@@ -51,15 +52,16 @@ def init_db():
  init_inventory_control(conn)
  init_valuation_audit(conn)
  init_traceability(conn)
+ init_manufacturing(conn)
 @app.on_event('startup')
 def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
 class InventoryIn(BaseModel):sku:str;description:str;quantity:int;location_code:str
 class MovementIn(BaseModel):sku:str;quantity:int;movement_type:str;from_location:str|None=None;to_location:str|None=None;reference:str|None=None
 @app.get('/api/status')
-def root():return {'system':'UNG-VECTOR','domain':'warehouse-logistics','status':'online','version':'0.6.1'}
+def root():return {'system':'UNG-VECTOR','domain':'warehouse-logistics','status':'online','version':'0.7.0'}
 @app.get('/health')
-def health():return {'status':'ok','service':'UNG-VECTOR','version':'0.6.1'}
+def health():return {'status':'ok','service':'UNG-VECTOR','version':'0.7.0'}
 @app.get('/ready')
 def ready():
  try:
@@ -67,7 +69,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS_BASE_URL}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS_BASE_URL}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','inventory-valuation','immutable-audit-ledger','midas-outbox','batch-lot-tracking','serial-tracking','expiration-tracking','traceability','recalls','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','janus-bearer-auth']}
+def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','inventory-valuation','immutable-audit-ledger','midas-outbox','batch-lot-tracking','serial-tracking','expiration-tracking','traceability','recalls','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','janus-bearer-auth','bom','mps','mrp','work-centers','routings','capacity-planning','production-orders','mto','mts','production-confirmation','scrap-tracking']}
 @app.get('/v1/locations')
 def locations(authorization:str|None=Header(None)):
  auth('vector.locations.read',authorization)
@@ -136,6 +138,7 @@ install_material_routes(app, conn, auth)
 install_inventory_control_routes(app, conn, auth, emit)
 install_valuation_audit_routes(app, conn, auth)
 install_traceability_routes(app, conn, auth)
+install_manufacturing_routes(app, conn, auth)
 
 from pathlib import Path
 from ui_portal import install_ui

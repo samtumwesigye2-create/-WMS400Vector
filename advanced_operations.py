@@ -25,6 +25,7 @@ def init_advanced_ops(conn):
           id UUID PRIMARY KEY, sku TEXT NOT NULL, reference TEXT NULL, defect TEXT NOT NULL,
           severity TEXT NOT NULL, status TEXT NOT NULL, corrective_action TEXT NULL,
           created_at TIMESTAMPTZ NOT NULL, closed_at TIMESTAMPTZ NULL)""")
+        c.execute("ALTER TABLE vector_carriers ADD COLUMN IF NOT EXISTS quality_score NUMERIC NOT NULL DEFAULT 0")
         c.execute("""CREATE TABLE IF NOT EXISTS vector_transport_exceptions(
           id UUID PRIMARY KEY, shipment_id UUID NOT NULL, exception_type TEXT NOT NULL,
           details TEXT NOT NULL, status TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL,

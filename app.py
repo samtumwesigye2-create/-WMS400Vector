@@ -16,8 +16,11 @@ from enterprise_suite import init_enterprise_suite, install_enterprise_suite_rou
 from advanced_operations import init_advanced_ops, install_advanced_ops_routes\nfrom acceptance_test import install_acceptance_routes
 from inventory_ageing import init_inventory_ageing, install_inventory_ageing_routes
 from warehouse_layout import init_warehouse_layout, install_warehouse_layout_routes
+from enterprise_structure import init_enterprise_structure, install_enterprise_structure_routes
+from mrp_areas import init_mrp_areas, install_mrp_area_routes
+from supply_chain_kpis import init_supply_chain_kpis, install_supply_chain_kpi_routes
 
-app=FastAPI(title='UNG-VECTOR',version='0.10.0')
+app=FastAPI(title='UNG-VECTOR',version='0.11.0')
 DB=os.getenv('DATABASE_URL','')
 JANUS_BASE_URL=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
 NEXUS_BASE_URL=os.getenv('NEXUS_BASE_URL','https://ung-nexus-production.up.railway.app').rstrip('/')
@@ -64,6 +67,9 @@ def init_db():
  init_advanced_ops(conn)
  init_inventory_ageing(conn)
  init_warehouse_layout(conn)
+ init_enterprise_structure(conn)
+ init_mrp_areas(conn)
+ init_supply_chain_kpis(conn)
 @app.on_event('startup')
 def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
@@ -156,6 +162,9 @@ install_enterprise_suite_routes(app, conn, auth)
 install_advanced_ops_routes(app, conn, auth)\ninstall_acceptance_routes(app, conn, auth)
 install_inventory_ageing_routes(app, conn, auth)
 install_warehouse_layout_routes(app, conn, auth)
+install_enterprise_structure_routes(app, conn, auth)
+install_mrp_area_routes(app, conn, auth)
+install_supply_chain_kpi_routes(app, conn, auth)
 
 from pathlib import Path
 from ui_portal import install_ui

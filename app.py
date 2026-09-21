@@ -35,7 +35,7 @@ def emit(target,message_type,payload):
  if not NEXUS_BASE_URL:return {'status':'disabled'}
  if not VECTOR_SERVICE_TOKEN:return {'status':'failed','error':'vector_service_token_missing'}
  body=json.dumps({'source_system':'UNG-VECTOR','target_system':target,'message_type':message_type,'payload':payload}).encode()
- req=urllib.request.Request(NEXUS_BASE_URL+'/v1/messages',data=body,method='POST',headers={'Authorization':f'Bearer {VECTOR_SERVICE_TOKEN}','Content-Type':'application/json','User-Agent':'UNG-VECTOR/0.24.0'})
+ req=urllib.request.Request(NEXUS_BASE_URL+'/v1/messages',data=body,method='POST',headers={'Authorization':f'Bearer {VECTOR_SERVICE_TOKEN}','Content-Type':'application/json','User-Agent':'UNG-VECTOR/0.25.0'})
  try:
   with urllib.request.urlopen(req,timeout=8) as r:return {'status':'delivered','response_code':r.status,'response':json.loads(r.read().decode() or '{}')}
  except urllib.error.HTTPError as e:return {'status':'failed','response_code':e.code,'error':f'http_{e.code}'}
@@ -78,16 +78,16 @@ def init_db():
  init_goods_movement(conn)
  init_mm_transactions(conn)
  init_release_approvals(conn)
-init_accounting(conn)
+ init_accounting(conn)
 @app.on_event('startup')
 def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
 class InventoryIn(BaseModel):sku:str;description:str;quantity:int;location_code:str
 class MovementIn(BaseModel):sku:str;quantity:int;movement_type:str;from_location:str|None=None;to_location:str|None=None;reference:str|None=None
 @app.get('/api/status')
-def root():return {'system':'UNG-VECTOR','domain':'warehouse-logistics','status':'online','version':'0.24.0'}
+def root():return {'system':'UNG-VECTOR','domain':'warehouse-logistics','status':'online','version':'0.25.0'}
 @app.get('/health')
-def health():return {'status':'ok','service':'UNG-VECTOR','version':'0.24.0'}
+def health():return {'status':'ok','service':'UNG-VECTOR','version':'0.25.0'}
 @app.get('/ready')
 def ready():
  try:

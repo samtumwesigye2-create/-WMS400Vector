@@ -47,14 +47,18 @@ def init_mm_transactions(conn):
    amount NUMERIC NOT NULL CHECK(amount>0),scheduled_date DATE NOT NULL,status TEXT NOT NULL,
    created_at TIMESTAMPTZ NOT NULL,UNIQUE(run_id,invoice_id))""")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_bank_execution_batches(
-   id UUID PRIMARY KEY,execution_ref TEXT UNIQUE NOT NULL,run_id UUID NOT NULL UNIQUE,
+   id UUID PRIMARY KEY,execution_ref TEXT UNIQUE NOT NULL,run_id UUID NOT NULL,
    total_amount NUMERIC NOT NULL,item_count INTEGER NOT NULL,status TEXT NOT NULL,
    created_by TEXT NULL,created_at TIMESTAMPTZ NOT NULL,acknowledged_at TIMESTAMPTZ NULL,
    bank_reference TEXT NULL,bank_message TEXT NULL)""")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_bank_execution_items(
-   id UUID PRIMARY KEY,batch_id UUID NOT NULL,run_item_id UUID NOT NULL UNIQUE,invoice_id UUID NOT NULL,
+   id UUID PRIMARY KEY,batch_id UUID NOT NULL,run_item_id UUID NOT NULL,invoice_id UUID NOT NULL,
    supplier_code TEXT NOT NULL,amount NUMERIC NOT NULL,status TEXT NOT NULL,
    bank_reference TEXT NULL,bank_message TEXT NULL,updated_at TIMESTAMPTZ NOT NULL)""")
+  c.execute("ALTER TABLE vector_bank_execution_batches DROP CONSTRAINT IF EXISTS vector_bank_execution_batches_run_id_key")
+  c.execute("ALTER TABLE vector_bank_execution_items DROP CONSTRAINT IF EXISTS vector_bank_execution_items_run_item_id_key")
+  c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_vector_bank_active_run ON vector_bank_execution_batches(run_id) WHERE status NOT IN ('rejected')")
+  c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_vector_bank_active_run_item ON vector_bank_execution_items(run_item_id) WHERE status NOT IN ('rejected')")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_p2p_audit_events(
    id UUID PRIMARY KEY,event_type TEXT NOT NULL,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,
    po_id UUID NULL,invoice_id UUID NULL,run_id UUID NULL,execution_ref TEXT NULL,
@@ -382,7 +386,7 @@ def install_mm_transaction_routes(app,conn,auth):
   with conn() as c:
    rid=uid(run_id,'run_id');run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s FOR UPDATE',(rid,)).fetchone()
    if not run:raise HTTPException(404,'payment_run_not_found')
-   existing=c.execute('SELECT * FROM vector_bank_execution_batches WHERE run_id=%s',(rid,)).fetchone()
+   existing=c.execute("SELECT * FROM vector_bank_execution_batches WHERE run_id=%s AND status<>'rejected' ORDER BY created_at DESC LIMIT 1",(rid,)).fetchone()
    if existing:return {'batch':existing,'instructions':c.execute('SELECT * FROM vector_bank_execution_items WHERE batch_id=%s ORDER BY id',(existing['id'],)).fetchall(),'note':'existing immutable handoff returned; no funds transmitted'}
    if run['status']!='ready_for_bank':raise HTTPException(409,'payment_run_not_ready_for_bank')
    items=c.execute("SELECT * FROM vector_payment_run_items WHERE run_id=%s AND status='ready' ORDER BY id FOR UPDATE",(rid,)).fetchall()
@@ -416,6 +420,7 @@ def install_mm_transaction_routes(app,conn,auth):
     c.execute("UPDATE vector_bank_execution_items SET status='rejected',bank_message=%s,updated_at=%s WHERE batch_id=%s",(b.message,now(),batch['id']))
     c.execute("UPDATE vector_payment_run_items SET status='ready' WHERE run_id=%s",(batch['run_id'],))
     c.execute("UPDATE vector_payment_runs SET status='ready_for_bank' WHERE id=%s",(batch['run_id'],))
+    c.execute("UPDATE vector_payment_schedules SET status='scheduled',updated_at=%s WHERE invoice_id IN (SELECT invoice_id FROM vector_payment_run_items WHERE run_id=%s)",(now(),batch['run_id']))
    else:
     c.execute("UPDATE vector_bank_execution_items SET status='accepted',updated_at=%s WHERE batch_id=%s",(now(),batch['id']))
    _audit(c,'bank_acknowledged','bank_execution',batch['id'],run_id=batch['run_id'],execution_ref=execution_ref,details={'status':b.status,'bank_reference':b.bank_reference,'message':b.message})
@@ -445,6 +450,7 @@ def install_mm_transaction_routes(app,conn,auth):
      paid=_payment_net(c,inv['id']);net=_invoice_net_amount(c,inv['id'],inv['amount']);pstatus='paid' if net-paid<=0.01 else 'partially_paid'
      c.execute('UPDATE vector_supplier_invoices SET payment_status=%s WHERE id=%s',(pstatus,inv['id']))
      c.execute("UPDATE vector_payment_run_items SET status='settled' WHERE id=%s",(riid,))
+     c.execute("UPDATE vector_payment_schedules SET status=CASE WHEN %s='paid' THEN 'completed' ELSE 'scheduled' END,updated_at=%s WHERE invoice_id=%s",(pstatus,now(),inv['id']))
     else:c.execute("UPDATE vector_payment_run_items SET status='rejected' WHERE id=%s",(riid,))
     c.execute("""UPDATE vector_bank_execution_items SET status=%s,bank_reference=%s,bank_message=%s,updated_at=%s WHERE id=%s""",
      (ack.status,ack.bank_reference,ack.message,now(),bei['id']))

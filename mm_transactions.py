@@ -2,6 +2,7 @@ from datetime import datetime,timezone
 from fastapi import Header,HTTPException
 from pydantic import BaseModel,Field
 from uuid import uuid4
+from release_approvals import create_approval_request
 def now():return datetime.now(timezone.utc)
 def init_mm_transactions(conn):
  with conn() as c:
@@ -16,7 +17,12 @@ def install_mm_transaction_routes(app,conn,auth):
  @app.post('/v1/procurement/requisitions',status_code=201)
  def pr(b:PR,authorization:str|None=Header(None)):
   u=auth('vector.procurement.write',authorization);n='PR-'+now().strftime('%Y%m%d%H%M%S%f')
-  with conn() as c:return c.execute("INSERT INTO vector_purchase_requisitions VALUES(%s,%s,%s,%s,%s,'open',%s,%s) RETURNING *",(str(uuid4()),n,b.sku,b.quantity,b.needed_by,str(u),now())).fetchone()
+  with conn() as c:
+   pr_id=str(uuid4());strategy=c.execute("SELECT * FROM vector_release_strategies WHERE active=TRUE AND document_type='PR' AND min_amount<=0 ORDER BY min_amount DESC LIMIT 1").fetchone()
+   status='pending_approval' if strategy else 'open'
+   row=c.execute("INSERT INTO vector_purchase_requisitions VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",(pr_id,n,b.sku,b.quantity,b.needed_by,status,str(u),now())).fetchone()
+   approval=create_approval_request(c,'PR',pr_id,0,str(u)) if strategy else None
+   return {'purchase_requisition':row,'approval_request':approval}
  @app.post('/v1/procurement/invoices/verify',status_code=201)
  def invoice(b:Invoice,authorization:str|None=Header(None)):
   auth('vector.procurement.write',authorization)

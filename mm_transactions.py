@@ -18,6 +18,14 @@ def init_mm_transactions(conn):
    reference TEXT NULL,status TEXT NOT NULL,created_by TEXT NULL,paid_at TIMESTAMPTZ NOT NULL)""")
   c.execute("CREATE INDEX IF NOT EXISTS idx_vector_supplier_payments_invoice ON vector_supplier_payments(invoice_id)")
   c.execute("CREATE INDEX IF NOT EXISTS idx_vector_supplier_payments_po ON vector_supplier_payments(po_id)")
+  c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_adjustments(
+   id UUID PRIMARY KEY,adjustment_no TEXT UNIQUE NOT NULL,invoice_id UUID NOT NULL,po_id UUID NOT NULL,
+   supplier_code TEXT NOT NULL,adjustment_type TEXT NOT NULL,amount NUMERIC NOT NULL CHECK(amount>0),
+   reason TEXT NOT NULL DEFAULT '',status TEXT NOT NULL,created_by TEXT NULL,created_at TIMESTAMPTZ NOT NULL)""")
+  c.execute("""CREATE TABLE IF NOT EXISTS vector_payment_reversals(
+   id UUID PRIMARY KEY,reversal_no TEXT UNIQUE NOT NULL,payment_id UUID NOT NULL UNIQUE,
+   amount NUMERIC NOT NULL CHECK(amount>0),reason TEXT NOT NULL,status TEXT NOT NULL,
+   created_by TEXT NULL,reversed_at TIMESTAMPTZ NOT NULL)""")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_scheduling_agreements(id UUID PRIMARY KEY,agreement_no TEXT UNIQUE NOT NULL,supplier_code TEXT NOT NULL,sku TEXT NOT NULL,start_date DATE NOT NULL,end_date DATE NOT NULL,quantity NUMERIC NOT NULL,status TEXT NOT NULL)""")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_release_strategies(id UUID PRIMARY KEY,code TEXT UNIQUE NOT NULL,document_type TEXT NOT NULL,min_amount NUMERIC NOT NULL DEFAULT 0,required_approvals INTEGER NOT NULL DEFAULT 1,active BOOLEAN NOT NULL DEFAULT TRUE)""")
 
@@ -25,6 +33,9 @@ class PR(BaseModel):sku:str;quantity:float=Field(gt=0);needed_by:str|None=None
 class Invoice(BaseModel):invoice_no:str;po_id:str;supplier_code:str;amount:float=Field(ge=0);quantity:float|None=Field(default=None,gt=0)
 class Agreement(BaseModel):agreement_no:str;supplier_code:str;sku:str;start_date:str;end_date:str;quantity:float=Field(gt=0)
 class PaymentIn(BaseModel):amount:float=Field(gt=0);reference:str|None=None
+class AdjustmentIn(BaseModel):adjustment_type:str;amount:float=Field(gt=0);reason:str=''
+class ReversalIn(BaseModel):reason:str
+class StatementIn(BaseModel):supplier_code:str;statement_balance:float
 
 def _po_totals(c,po_id):
  po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s FOR UPDATE',(po_id,)).fetchone()
@@ -34,6 +45,20 @@ def _po_totals(c,po_id):
  inv=c.execute("""SELECT COALESCE(sum(invoice_quantity),0) qty,COALESCE(sum(amount),0) value
   FROM vector_supplier_invoices WHERE po_id=%s AND status='verified'""",(po_id,)).fetchone()
  return po,received,float(inv['qty']),float(inv['value'])
+
+def _invoice_net_amount(c,invoice_id,base_amount):
+ a=c.execute("""SELECT COALESCE(sum(CASE WHEN adjustment_type='credit_memo' AND status='posted' THEN amount
+ WHEN adjustment_type='debit_adjustment' AND status='posted' THEN -amount ELSE 0 END),0) net_credit
+ FROM vector_supplier_adjustments WHERE invoice_id=%s""",(invoice_id,)).fetchone()['net_credit']
+ return max(0,float(base_amount)-float(a))
+
+def _payment_net(c,invoice_id):
+ p=float(c.execute("""SELECT COALESCE(sum(amount),0) total FROM vector_supplier_payments
+ WHERE invoice_id=%s AND status='posted'""",(invoice_id,)).fetchone()['total'])
+ r=float(c.execute("""SELECT COALESCE(sum(pr.amount),0) total FROM vector_payment_reversals pr
+ JOIN vector_supplier_payments p ON p.id=pr.payment_id
+ WHERE p.invoice_id=%s AND pr.status='posted'""",(invoice_id,)).fetchone()['total'])
+ return max(0,p-r)
 
 def _maybe_complete(c,po_id):
  po,received,invoiced_qty,invoiced_value=_po_totals(c,po_id)
@@ -102,8 +127,8 @@ def install_mm_transaction_routes(app,conn,auth):
    if not inv:raise HTTPException(404,'supplier_invoice_not_found')
    if inv['status']!='verified' or inv['match_status']!='matched':raise HTTPException(409,'invoice_not_verified_and_matched')
    if inv['payment_status'] not in ('payable','partially_paid'):raise HTTPException(409,'invoice_not_payable')
-   paid=float(c.execute("SELECT COALESCE(sum(amount),0) total FROM vector_supplier_payments WHERE invoice_id=%s AND status='posted'",(iid,)).fetchone()['total'])
-   invoice_amount=float(inv['amount']);remaining=max(0,invoice_amount-paid)
+   paid=_payment_net(c,iid)
+   invoice_amount=_invoice_net_amount(c,iid,inv['amount']);remaining=max(0,invoice_amount-paid)
    if b.amount>remaining+0.01:raise HTTPException(409,{'error':'payment_exceeds_invoice_balance','remaining_balance':remaining})
    pno='PAY-'+now().strftime('%Y%m%d%H%M%S%f')
    payment=c.execute("""INSERT INTO vector_supplier_payments
@@ -125,9 +150,63 @@ def install_mm_transaction_routes(app,conn,auth):
   with conn() as c:
    iid=UUID(invoice_id);inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s',(iid,)).fetchone()
    if not inv:raise HTTPException(404,'supplier_invoice_not_found')
-   paid=float(c.execute("SELECT COALESCE(sum(amount),0) total FROM vector_supplier_payments WHERE invoice_id=%s AND status='posted'",(iid,)).fetchone()['total'])
+   paid=_payment_net(c,iid);net_amount=_invoice_net_amount(c,iid,inv['amount'])
    payments=c.execute("SELECT * FROM vector_supplier_payments WHERE invoice_id=%s ORDER BY paid_at",(iid,)).fetchall()
-   return {'invoice':inv,'invoice_amount':float(inv['amount']),'paid_total':paid,'remaining_balance':max(0,float(inv['amount'])-paid),'payments':payments}
+   adjustments=c.execute("SELECT * FROM vector_supplier_adjustments WHERE invoice_id=%s ORDER BY created_at",(iid,)).fetchall()
+   reversals=c.execute("""SELECT pr.* FROM vector_payment_reversals pr JOIN vector_supplier_payments p ON p.id=pr.payment_id
+    WHERE p.invoice_id=%s ORDER BY pr.reversed_at""",(iid,)).fetchall()
+   return {'invoice':inv,'invoice_amount':float(inv['amount']),'net_invoice_amount':net_amount,'paid_total':paid,
+    'remaining_balance':max(0,net_amount-paid),'payments':payments,'adjustments':adjustments,'payment_reversals':reversals}
+
+ @app.post('/v1/procurement/invoices/{invoice_id}/adjustments',status_code=201)
+ def adjust_invoice(invoice_id:str,b:AdjustmentIn,authorization:str|None=Header(None)):
+  principal=auth('vector.payables.write',authorization)
+  if b.adjustment_type not in ('credit_memo','debit_adjustment'):raise HTTPException(400,'invalid_adjustment_type')
+  with conn() as c:
+   iid=UUID(invoice_id);inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
+   if not inv:raise HTTPException(404,'supplier_invoice_not_found')
+   if inv['status']!='verified':raise HTTPException(409,'invoice_not_verified')
+   current_net=_invoice_net_amount(c,iid,inv['amount']);paid=_payment_net(c,iid)
+   if b.adjustment_type=='credit_memo' and b.amount>current_net-paid+0.01:raise HTTPException(409,'credit_memo_exceeds_open_balance')
+   ano=('CM-' if b.adjustment_type=='credit_memo' else 'DA-')+now().strftime('%Y%m%d%H%M%S%f')
+   row=c.execute("""INSERT INTO vector_supplier_adjustments VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'posted',%s,%s) RETURNING *""",
+    (str(uuid4()),ano,iid,inv['po_id'],inv['supplier_code'],b.adjustment_type,b.amount,b.reason,str(principal),now())).fetchone()
+   net_amount=_invoice_net_amount(c,iid,inv['amount']);paid=_payment_net(c,iid);balance=max(0,net_amount-paid)
+   pstatus='paid' if balance<=0.01 else ('partially_paid' if paid>0 else inv['payment_status'])
+   invoice=c.execute("UPDATE vector_supplier_invoices SET payment_status=%s WHERE id=%s RETURNING *",(pstatus,iid)).fetchone()
+   return {'adjustment':row,'invoice':invoice,'net_invoice_amount':net_amount,'paid_total':paid,'remaining_balance':balance}
+
+ @app.post('/v1/procurement/payments/{payment_id}/reverse',status_code=201)
+ def reverse_payment(payment_id:str,b:ReversalIn,authorization:str|None=Header(None)):
+  principal=auth('vector.payables.write',authorization)
+  with conn() as c:
+   pid=UUID(payment_id);p=c.execute('SELECT * FROM vector_supplier_payments WHERE id=%s FOR UPDATE',(pid,)).fetchone()
+   if not p:raise HTTPException(404,'payment_not_found')
+   if p['status']!='posted':raise HTTPException(409,'payment_not_posted')
+   if c.execute('SELECT 1 FROM vector_payment_reversals WHERE payment_id=%s',(pid,)).fetchone():raise HTTPException(409,'payment_already_reversed')
+   rno='REV-'+now().strftime('%Y%m%d%H%M%S%f')
+   rev=c.execute("""INSERT INTO vector_payment_reversals VALUES(%s,%s,%s,%s,%s,'posted',%s,%s) RETURNING *""",
+    (str(uuid4()),rno,pid,p['amount'],b.reason,str(principal),now())).fetchone()
+   inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(p['invoice_id'],)).fetchone()
+   paid=_payment_net(c,p['invoice_id']);net_amount=_invoice_net_amount(c,p['invoice_id'],inv['amount']);balance=max(0,net_amount-paid)
+   pstatus='payable' if paid<=0 else 'partially_paid'
+   invoice=c.execute("UPDATE vector_supplier_invoices SET payment_status=%s WHERE id=%s RETURNING *",(pstatus,p['invoice_id'])).fetchone()
+   po=c.execute('SELECT status FROM vector_purchase_orders WHERE id=%s',(p['po_id'],)).fetchone()
+   if po and po['status']=='settled':c.execute("UPDATE vector_purchase_orders SET status='complete' WHERE id=%s",(p['po_id'],))
+   return {'reversal':rev,'invoice':invoice,'paid_total':paid,'remaining_balance':balance}
+
+ @app.post('/v1/procurement/suppliers/statement-reconciliation')
+ def reconcile_statement(b:StatementIn,authorization:str|None=Header(None)):
+  auth('vector.payables.read',authorization)
+  with conn() as c:
+   rows=c.execute("""SELECT id,amount FROM vector_supplier_invoices
+    WHERE supplier_code=%s AND status='verified'""",(b.supplier_code,)).fetchall()
+   ledger=0.0
+   for inv in rows:
+    net=_invoice_net_amount(c,inv['id'],inv['amount']);paid=_payment_net(c,inv['id']);ledger+=max(0,net-paid)
+   variance=round(float(b.statement_balance)-ledger,2)
+   return {'supplier_code':b.supplier_code,'supplier_statement_balance':float(b.statement_balance),
+    'vector_open_balance':round(ledger,2),'variance':variance,'reconciled':abs(variance)<=0.01,'open_invoice_count':len(rows)}
 
  @app.get('/v1/procurement/purchase-orders/{po_id}/lifecycle')
  def lifecycle(po_id:str,authorization:str|None=Header(None)):

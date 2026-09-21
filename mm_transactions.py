@@ -31,6 +31,7 @@ def install_mm_transaction_routes(app,conn,auth):
    po_id=UUID(b.po_id)
    po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s',(po_id,)).fetchone()
    if not po:raise HTTPException(404,'purchase_order_not_found')
+   if po['status'] in ('pending_approval','rejected'):raise HTTPException(409,'purchase_order_not_released')
    if po['supplier_code']!=b.supplier_code:raise HTTPException(409,'supplier_po_mismatch')
    rec=float(c.execute("SELECT COALESCE(sum(CASE WHEN movement_type='101' THEN quantity WHEN movement_type='102' THEN -quantity ELSE 0 END),0) q FROM vector_material_documents WHERE po_id=%s AND status='posted'",(po_id,)).fetchone()['q'])
    po_qty=float(po['quantity']);po_value=po_qty*float(po['unit_cost']);invoice_qty=float(b.quantity) if b.quantity is not None else po_qty

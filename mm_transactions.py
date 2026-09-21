@@ -3,6 +3,7 @@ from fastapi import Header,HTTPException
 from pydantic import BaseModel,Field
 from uuid import uuid4,UUID
 from release_approvals import create_approval_request
+import json
 
 def now():return datetime.now(timezone.utc)
 
@@ -40,6 +41,12 @@ def init_mm_transactions(conn):
    id UUID PRIMARY KEY,batch_id UUID NOT NULL,run_item_id UUID NOT NULL UNIQUE,invoice_id UUID NOT NULL,
    supplier_code TEXT NOT NULL,amount NUMERIC NOT NULL,status TEXT NOT NULL,
    bank_reference TEXT NULL,bank_message TEXT NULL,updated_at TIMESTAMPTZ NOT NULL)""")
+  c.execute("""CREATE TABLE IF NOT EXISTS vector_p2p_audit_events(
+   id UUID PRIMARY KEY,event_type TEXT NOT NULL,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,
+   po_id UUID NULL,invoice_id UUID NULL,run_id UUID NULL,execution_ref TEXT NULL,
+   actor TEXT NULL,details JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL)""")
+  c.execute("CREATE INDEX IF NOT EXISTS idx_vector_p2p_audit_po ON vector_p2p_audit_events(po_id,created_at)")
+  c.execute("CREATE INDEX IF NOT EXISTS idx_vector_p2p_audit_invoice ON vector_p2p_audit_events(invoice_id,created_at)")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_payments(
    id UUID PRIMARY KEY,payment_no TEXT UNIQUE NOT NULL,invoice_id UUID NOT NULL,
    po_id UUID NOT NULL,supplier_code TEXT NOT NULL,amount NUMERIC NOT NULL CHECK(amount>0),
@@ -69,6 +76,11 @@ class PaymentScheduleIn(BaseModel):scheduled_date:date;scheduled_amount:float=Fi
 class PaymentRunIn(BaseModel):run_date:date|None=None
 class BankAckIn(BaseModel):status:str;bank_reference:str|None=None;message:str=''
 class BankItemAckIn(BaseModel):run_item_id:str;status:str;bank_reference:str|None=None;message:str=''
+
+def _audit(c,event_type,entity_type,entity_id,actor=None,po_id=None,invoice_id=None,run_id=None,execution_ref=None,details=None):
+ c.execute("""INSERT INTO vector_p2p_audit_events VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)""",
+  (str(uuid4()),event_type,entity_type,str(entity_id),po_id,invoice_id,run_id,execution_ref,
+   str(actor) if actor is not None else None,json.dumps(details or {},default=str),now()))
 
 def _po_totals(c,po_id):
  po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s FOR UPDATE',(po_id,)).fetchone()
@@ -143,6 +155,7 @@ def install_mm_transaction_routes(app,conn,auth):
    complete=False
    if status=='verified':complete,rec,total_qty,total_value,po_qty,po_value=_maybe_complete(c,po_id)
    else:total_qty,total_value=prior_qty,prior_value
+   _audit(c,'invoice_verified' if status=='verified' else 'invoice_parked','invoice',row['id'],po_id=po_id,invoice_id=row['id'],details={'invoice_no':row['invoice_no'],'amount':b.amount,'match_status':match})
    return {**row,'po_quantity':po_qty,'received_quantity':rec,'verified_invoice_quantity':total_qty,
     'verified_invoice_value':total_value,'po_value':po_value,'expected_invoice_value':expected,
     'match_reasons':reasons,'po_complete':complete}
@@ -304,6 +317,7 @@ def install_mm_transaction_routes(app,conn,auth):
    approved_at=None if approval else now()
    run=c.execute("UPDATE vector_payment_runs SET status=%s,approved_at=%s WHERE id=%s RETURNING *",(status,approved_at,run_id)).fetchone()
    c.execute("UPDATE vector_payment_run_items SET status=%s WHERE run_id=%s",('pending_approval' if approval else 'approved',run_id))
+   _audit(c,'payment_run_created','payment_run',run_id,principal,run_id=run_id,details={'run_no':run_no,'total_amount':total,'item_count':count,'status':status})
    return {'payment_run':run,'approval_request':approval,'note':'batch created only; no funds transmitted'}
 
  @app.get('/v1/procurement/payment-runs')
@@ -364,6 +378,7 @@ def install_mm_transaction_routes(app,conn,auth):
      (str(uuid4()),bid,item['id'],item['invoice_id'],item['supplier_code'],item['amount'],now())).fetchone())
    c.execute("UPDATE vector_payment_run_items SET status='handed_off' WHERE run_id=%s",(rid,))
    c.execute("UPDATE vector_payment_runs SET status='handed_off' WHERE id=%s",(rid,))
+   _audit(c,'bank_handoff_generated','bank_execution',bid,principal,run_id=rid,execution_ref=eref,details={'total_amount':run['total_amount'],'item_count':run['item_count']})
    return {'batch':batch,'instructions':instructions,'note':'immutable execution instructions generated; VECTOR has not transmitted funds'}
 
  @app.post('/v1/procurement/bank-executions/{execution_ref}/acknowledge')
@@ -382,6 +397,7 @@ def install_mm_transaction_routes(app,conn,auth):
     c.execute("UPDATE vector_payment_runs SET status='ready_for_bank' WHERE id=%s",(batch['run_id'],))
    else:
     c.execute("UPDATE vector_bank_execution_items SET status='accepted',updated_at=%s WHERE batch_id=%s",(now(),batch['id']))
+   _audit(c,'bank_acknowledged','bank_execution',batch['id'],run_id=batch['run_id'],execution_ref=execution_ref,details={'status':b.status,'bank_reference':b.bank_reference,'message':b.message})
    return batch
 
  @app.post('/v1/procurement/bank-executions/{execution_ref}/reconcile')
@@ -418,7 +434,41 @@ def install_mm_transaction_routes(app,conn,auth):
     final='settled' if rejected==0 else ('rejected' if settled==0 else 'partially_settled')
     c.execute('UPDATE vector_bank_execution_batches SET status=%s WHERE id=%s',(final,batch['id']))
     c.execute('UPDATE vector_payment_runs SET status=%s WHERE id=%s',(final,batch['run_id']))
+   _audit(c,'bank_reconciled','bank_execution',batch['id'],principal,run_id=batch['run_id'],execution_ref=execution_ref,details={'states':states,'pending_items':pending})
    return {'execution_ref':execution_ref,'states':states,'pending_items':pending,'note':'reconciliation records externally reported bank results'}
+
+ @app.get('/v1/procurement/audit/purchase-orders/{po_id}/timeline')
+ def p2p_timeline(po_id:str,authorization:str|None=Header(None)):
+  auth('vector.procurement.read',authorization)
+  with conn() as c:
+   pid=UUID(po_id);po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s',(pid,)).fetchone()
+   if not po:raise HTTPException(404,'purchase_order_not_found')
+   receipts=c.execute("SELECT * FROM vector_material_documents WHERE po_id=%s ORDER BY posted_at",(pid,)).fetchall()
+   invoices=c.execute("SELECT * FROM vector_supplier_invoices WHERE po_id=%s ORDER BY created_at",(pid,)).fetchall()
+   invoice_ids=[x['id'] for x in invoices]
+   payments=c.execute("SELECT * FROM vector_supplier_payments WHERE po_id=%s ORDER BY paid_at",(pid,)).fetchall()
+   events=c.execute("SELECT * FROM vector_p2p_audit_events WHERE po_id=%s ORDER BY created_at",(pid,)).fetchall()
+   approvals=c.execute("""SELECT ar.* FROM vector_approval_requests ar WHERE
+    (ar.document_type='PO' AND ar.document_id=%s) ORDER BY ar.created_at""",(pid,)).fetchall()
+   return {'purchase_order':po,'goods_movements':receipts,'invoices':invoices,'approvals':approvals,
+    'payments':payments,'audit_events':events,'invoice_ids':invoice_ids}
+
+ @app.get('/v1/procurement/audit/exceptions')
+ def p2p_audit_exceptions(authorization:str|None=Header(None)):
+  auth('vector.procurement.read',authorization);today=date.today()
+  with conn() as c:
+   out=[]
+   rows=c.execute("""SELECT * FROM vector_supplier_invoices WHERE status='verified' AND payment_status<>'paid'""").fetchall()
+   for inv in rows:
+    due=inv['due_date'] or (inv['invoice_date'] or inv['created_at'].date())+timedelta(days=int(inv['terms_days'] or 30))
+    balance=max(0,_invoice_net_amount(c,inv['id'],inv['amount'])-_payment_net(c,inv['id']))
+    if balance>0.01 and due<today:out.append({'type':'overdue_invoice','severity':'medium','invoice_id':inv['id'],'po_id':inv['po_id'],'open_balance':round(balance,2),'days_overdue':(today-due).days})
+   stale=c.execute("""SELECT pr.* FROM vector_payment_runs pr WHERE pr.status IN ('pending_approval','ready_for_bank','handed_off')
+    AND pr.created_at<%s""",(now()-timedelta(days=2),)).fetchall()
+   for r in stale:out.append({'type':'stale_payment_run','severity':'high' if r['status']=='handed_off' else 'medium','run_id':r['id'],'run_no':r['run_no'],'status':r['status']})
+   rejected=c.execute("SELECT * FROM vector_bank_execution_batches WHERE status IN ('rejected','partially_settled') ORDER BY created_at DESC LIMIT 100").fetchall()
+   for b in rejected:out.append({'type':'bank_execution_exception','severity':'high','execution_ref':b['execution_ref'],'status':b['status'],'run_id':b['run_id']})
+   return {'as_of':now(),'exception_count':len(out),'items':out}
 
  @app.get('/v1/procurement/bank-executions/{execution_ref}')
  def bank_execution_status(execution_ref:str,authorization:str|None=Header(None)):

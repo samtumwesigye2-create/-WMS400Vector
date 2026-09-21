@@ -2,6 +2,7 @@ from datetime import datetime,timezone
 from uuid import uuid4
 from fastapi import Header,HTTPException
 from pydantic import BaseModel,Field
+import json
 
 def now():return datetime.now(timezone.utc)
 
@@ -40,6 +41,8 @@ class StrategyIn(BaseModel):
  code:str;document_type:str;min_amount:float=Field(default=0,ge=0);required_approvals:int=Field(default=1,ge=1,le=20);active:bool=True
 class DecisionIn(BaseModel):
  decision:str;comment:str=''
+class ExceptionIn(BaseModel):
+ exception_type:str;severity:str='medium';source:str;reference:str|None=None;details:dict={};amount:float=Field(default=0,ge=0)
 
 def _release_document(c,r):
  if r['document_type']=='PO':
@@ -58,6 +61,17 @@ def _reject_document(c,r):
   c.execute("UPDATE vector_exceptions SET status='rejected' WHERE id=%s",(r['document_id'],))
 
 def install_release_approval_routes(app,conn,auth):
+ @app.post('/v1/approvals/exceptions',status_code=201)
+ def exception(b:ExceptionIn,authorization:str|None=Header(None)):
+  principal=auth('vector.approvals.write',authorization)
+  with conn() as c:
+   exception_id=str(uuid4());strategy=matching_strategy(c,'EXCEPTION',b.amount)
+   status='pending_approval' if strategy else 'open'
+   row=c.execute("""INSERT INTO vector_exceptions VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,NULL) RETURNING *""",
+    (exception_id,b.exception_type,b.severity,b.source,b.reference,json.dumps(b.details),status,now())).fetchone()
+   approval=create_approval_request(c,'EXCEPTION',exception_id,b.amount,str(principal)) if strategy else None
+   return {'exception':row,'approval_request':approval}
+
  @app.post('/v1/approvals/strategies',status_code=201)
  def strategy(b:StrategyIn,authorization:str|None=Header(None)):
   auth('vector.approvals.admin',authorization)

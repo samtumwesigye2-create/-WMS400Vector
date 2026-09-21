@@ -140,6 +140,67 @@ def install_accounting_routes(app,conn,auth):
    c.execute("UPDATE vector_journal_entries SET status='reversed' WHERE id=%s",(jid,))
    return {'journal':rev,'reversed_journal_id':jid}
 
+
+ @app.get('/v1/accounting/trial-balance')
+ def trial_balance(as_of:str|None=None,authorization:str|None=Header(None)):
+  auth('vector.accounting.read',authorization)
+  with conn() as c:
+   return c.execute("""SELECT a.code,a.name,a.account_type,COALESCE(SUM(l.debit),0) debit,COALESCE(SUM(l.credit),0) credit,
+    COALESCE(SUM(l.debit-l.credit),0) balance FROM vector_gl_accounts a LEFT JOIN vector_journal_lines l ON l.account_code=a.code
+    LEFT JOIN vector_journal_entries j ON j.id=l.journal_id AND j.status IN ('posted','reversed')
+    WHERE (%s IS NULL OR j.entry_date<=%s::date) GROUP BY a.code,a.name,a.account_type ORDER BY a.code""",(as_of,as_of)).fetchall()
+
+ @app.get('/v1/accounting/journal-register')
+ def journal_register(start_date:str|None=None,end_date:str|None=None,authorization:str|None=Header(None)):
+  auth('vector.accounting.read',authorization)
+  with conn() as c:return c.execute("""SELECT j.*,COALESCE(SUM(l.debit),0) amount FROM vector_journal_entries j
+   LEFT JOIN vector_journal_lines l ON l.journal_id=j.id WHERE (%s IS NULL OR j.entry_date>=%s::date) AND (%s IS NULL OR j.entry_date<=%s::date)
+   GROUP BY j.id ORDER BY j.entry_date,j.created_at""",(start_date,start_date,end_date,end_date)).fetchall()
+
+ @app.get('/v1/accounting/income-statement')
+ def income_statement(start_date:str|None=None,end_date:str|None=None,authorization:str|None=Header(None)):
+  auth('vector.accounting.read',authorization)
+  with conn() as c:
+   rows=c.execute("""SELECT a.code,a.name,a.account_type,COALESCE(SUM(l.credit-l.debit),0) amount FROM vector_gl_accounts a
+    LEFT JOIN vector_journal_lines l ON l.account_code=a.code LEFT JOIN vector_journal_entries j ON j.id=l.journal_id
+    WHERE a.account_type IN ('revenue','expense') AND (%s IS NULL OR j.entry_date>=%s::date) AND (%s IS NULL OR j.entry_date<=%s::date)
+    GROUP BY a.code,a.name,a.account_type ORDER BY a.code""",(start_date,start_date,end_date,end_date)).fetchall()
+   revenue=sum((Decimal(str(x['amount'])) for x in rows if x['account_type']=='revenue'),Decimal('0'))
+   expenses=-sum((Decimal(str(x['amount'])) for x in rows if x['account_type']=='expense'),Decimal('0'))
+   return {'accounts':rows,'revenue':revenue,'expenses':expenses,'net_income':revenue-expenses}
+
+ @app.get('/v1/accounting/balance-sheet')
+ def balance_sheet(as_of:str|None=None,authorization:str|None=Header(None)):
+  auth('vector.accounting.read',authorization)
+  with conn() as c:return c.execute("""SELECT a.code,a.name,a.account_type,
+   COALESCE(SUM(CASE WHEN a.account_type='asset' THEN l.debit-l.credit ELSE l.credit-l.debit END),0) balance
+   FROM vector_gl_accounts a LEFT JOIN vector_journal_lines l ON l.account_code=a.code LEFT JOIN vector_journal_entries j ON j.id=l.journal_id
+   WHERE a.account_type IN ('asset','liability','equity') AND (%s IS NULL OR j.entry_date<=%s::date)
+   GROUP BY a.code,a.name,a.account_type ORDER BY a.code""",(as_of,as_of)).fetchall()
+
+ @app.get('/v1/accounting/ap-reconciliation')
+ def ap_reconciliation(authorization:str|None=Header(None)):
+  auth('vector.accounting.read',authorization)
+  with conn() as c:
+   gl=c.execute("SELECT COALESCE(SUM(credit-debit),0) v FROM vector_journal_lines WHERE account_code='2000'").fetchone()['v']
+   ap=c.execute("""SELECT COALESCE(SUM(i.amount),0) v FROM vector_supplier_invoices i WHERE i.status='verified'""").fetchone()['v']
+   paid=c.execute("SELECT COALESCE(SUM(amount),0) v FROM vector_supplier_payments WHERE status='posted'").fetchone()['v']
+   expected=Decimal(str(ap))-Decimal(str(paid))
+   return {'gl_ap':gl,'operational_ap_before_adjustments':expected,'difference_before_adjustments':Decimal(str(gl))-expected}
+
+ @app.post('/v1/accounting/periods',status_code=201)
+ def create_period(period_code:str,start_date:str,end_date:str,authorization:str|None=Header(None)):
+  auth('vector.accounting.write',authorization)
+  with conn() as c:return c.execute("INSERT INTO vector_accounting_periods VALUES(%s,%s,%s,%s,'open',%s) RETURNING *",(str(uuid4()),period_code,start_date,end_date,now())).fetchone()
+
+ @app.post('/v1/accounting/periods/{period_code}/close')
+ def close_period(period_code:str,authorization:str|None=Header(None)):
+  auth('vector.accounting.write',authorization)
+  with conn() as c:
+   r=c.execute("UPDATE vector_accounting_periods SET status='closed' WHERE period_code=%s AND status='open' RETURNING *",(period_code,)).fetchone()
+   if not r:raise HTTPException(404,'open_period_not_found')
+   return r
+
  @app.get('/v1/accounting/source/{source_type}/{source_id}')
  def source_journals(source_type:str,source_id:str,authorization:str|None=Header(None)):
   auth('vector.accounting.read',authorization)

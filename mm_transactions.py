@@ -18,6 +18,11 @@ def init_mm_transactions(conn):
   c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_payment_terms(
    supplier_code TEXT PRIMARY KEY,terms_days INTEGER NOT NULL CHECK(terms_days>=0),
    description TEXT NOT NULL DEFAULT '',updated_at TIMESTAMPTZ NOT NULL)""")
+  c.execute("""CREATE TABLE IF NOT EXISTS vector_payment_schedules(
+   id UUID PRIMARY KEY,invoice_id UUID NOT NULL UNIQUE,supplier_code TEXT NOT NULL,
+   scheduled_date DATE NOT NULL,scheduled_amount NUMERIC NOT NULL CHECK(scheduled_amount>0),
+   priority INTEGER NOT NULL DEFAULT 5 CHECK(priority BETWEEN 1 AND 10),
+   status TEXT NOT NULL,created_by TEXT NULL,created_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL)""")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_payments(
    id UUID PRIMARY KEY,payment_no TEXT UNIQUE NOT NULL,invoice_id UUID NOT NULL,
    po_id UUID NOT NULL,supplier_code TEXT NOT NULL,amount NUMERIC NOT NULL CHECK(amount>0),
@@ -43,6 +48,7 @@ class AdjustmentIn(BaseModel):adjustment_type:str;amount:float=Field(gt=0);reaso
 class ReversalIn(BaseModel):reason:str
 class StatementIn(BaseModel):supplier_code:str;statement_balance:float
 class PaymentTermsIn(BaseModel):terms_days:int=Field(ge=0,le=3650);description:str=''
+class PaymentScheduleIn(BaseModel):scheduled_date:date;scheduled_amount:float=Field(gt=0);priority:int=Field(default=5,ge=1,le=10)
 
 def _po_totals(c,po_id):
  po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s FOR UPDATE',(po_id,)).fetchone()
@@ -171,6 +177,83 @@ def install_mm_transaction_routes(app,conn,auth):
     if balance>0.01:out.append({'invoice_id':inv['id'],'invoice_no':inv['invoice_no'],'supplier_code':inv['supplier_code'],
      'due_date':inv['due_date'],'days_overdue':(today-inv['due_date']).days,'open_balance':round(balance,2)})
    return {'as_of':today,'overdue_count':len(out),'overdue_total':round(sum(x['open_balance'] for x in out),2),'items':out}
+
+ @app.get('/v1/procurement/cash-requirements')
+ def cash_requirements(days:int=30,group_by:str='day',authorization:str|None=Header(None)):
+  auth('vector.payables.read',authorization)
+  if days<1 or days>3650:raise HTTPException(400,'days_out_of_range')
+  if group_by not in ('day','week'):raise HTTPException(400,'group_by_must_be_day_or_week')
+  start=date.today();end=start+timedelta(days=days)
+  with conn() as c:
+   rows=c.execute("""SELECT * FROM vector_supplier_invoices
+    WHERE status='verified' AND payment_status<>'paid' AND due_date IS NOT NULL AND due_date<=%s
+    ORDER BY due_date,supplier_code""",(end,)).fetchall()
+   periods={};items=[];total=0.0;overdue=0.0
+   for inv in rows:
+    net=_invoice_net_amount(c,inv['id'],inv['amount']);paid=_payment_net(c,inv['id']);balance=max(0,net-paid)
+    if balance<=0.01:continue
+    due=inv['due_date'];key=due.isoformat() if group_by=='day' else (due-timedelta(days=due.weekday())).isoformat()
+    periods[key]=periods.get(key,0.0)+balance;total+=balance
+    if due<start:overdue+=balance
+    items.append({'invoice_id':inv['id'],'invoice_no':inv['invoice_no'],'supplier_code':inv['supplier_code'],
+     'due_date':due,'open_balance':round(balance,2),'overdue':due<start})
+   return {'as_of':start,'horizon_end':end,'group_by':group_by,'total_cash_required':round(total,2),
+    'overdue_cash_required':round(overdue,2),'periods':{k:round(v,2) for k,v in sorted(periods.items())},'items':items}
+
+ @app.put('/v1/procurement/invoices/{invoice_id}/payment-schedule')
+ def schedule_payment(invoice_id:str,b:PaymentScheduleIn,authorization:str|None=Header(None)):
+  principal=auth('vector.payables.write',authorization)
+  with conn() as c:
+   iid=UUID(invoice_id);inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
+   if not inv:raise HTTPException(404,'supplier_invoice_not_found')
+   if inv['status']!='verified' or inv['match_status']!='matched':raise HTTPException(409,'invoice_not_verified_and_matched')
+   net=_invoice_net_amount(c,iid,inv['amount']);paid=_payment_net(c,iid);balance=max(0,net-paid)
+   if balance<=0.01:raise HTTPException(409,'invoice_has_no_open_balance')
+   if b.scheduled_amount>balance+0.01:raise HTTPException(409,{'error':'scheduled_amount_exceeds_open_balance','open_balance':balance})
+   if b.scheduled_date<date.today():raise HTTPException(400,'scheduled_date_in_past')
+   row=c.execute("""INSERT INTO vector_payment_schedules
+    VALUES(%s,%s,%s,%s,%s,%s,'scheduled',%s,%s,%s)
+    ON CONFLICT(invoice_id) DO UPDATE SET scheduled_date=EXCLUDED.scheduled_date,
+    scheduled_amount=EXCLUDED.scheduled_amount,priority=EXCLUDED.priority,status='scheduled',
+    updated_at=EXCLUDED.updated_at RETURNING *""",
+    (str(uuid4()),iid,inv['supplier_code'],b.scheduled_date,b.scheduled_amount,b.priority,str(principal),now(),now())).fetchone()
+   return {'schedule':row,'open_balance':round(balance,2),'note':'schedule only; no funds are transmitted'}
+
+ @app.get('/v1/procurement/payment-schedule')
+ def payment_schedule(start:date|None=None,end:date|None=None,authorization:str|None=Header(None)):
+  auth('vector.payables.read',authorization);s=start or date.today();e=end or (s+timedelta(days=30))
+  if e<s:raise HTTPException(400,'end_before_start')
+  with conn() as c:
+   rows=c.execute("""SELECT ps.*,si.invoice_no,si.due_date,si.payment_status FROM vector_payment_schedules ps
+    JOIN vector_supplier_invoices si ON si.id=ps.invoice_id
+    WHERE ps.status='scheduled' AND ps.scheduled_date BETWEEN %s AND %s
+    ORDER BY ps.scheduled_date,ps.priority ASC,si.due_date""",(s,e)).fetchall()
+   return {'start':s,'end':e,'scheduled_total':round(sum(float(r['scheduled_amount']) for r in rows),2),'items':rows}
+
+ @app.post('/v1/procurement/payment-schedule/auto-prioritize')
+ def auto_prioritize(days:int=30,budget:float|None=None,authorization:str|None=Header(None)):
+  auth('vector.payables.write',authorization)
+  if days<1 or days>3650:raise HTTPException(400,'days_out_of_range')
+  today=date.today();end=today+timedelta(days=days)
+  with conn() as c:
+   rows=c.execute("""SELECT * FROM vector_supplier_invoices
+    WHERE status='verified' AND match_status='matched' AND payment_status IN ('payable','partially_paid','awaiting_release')
+    AND due_date IS NOT NULL AND due_date<=%s ORDER BY due_date,supplier_code""",(end,)).fetchall()
+   remaining=float(budget) if budget is not None else None;plan=[];scheduled_total=0.0
+   for inv in rows:
+    net=_invoice_net_amount(c,inv['id'],inv['amount']);paid=_payment_net(c,inv['id']);balance=max(0,net-paid)
+    if balance<=0.01:continue
+    amount=balance if remaining is None else min(balance,max(0,remaining))
+    if amount<=0:break
+    days_overdue=max(0,(today-inv['due_date']).days)
+    priority=1 if days_overdue>0 else (2 if inv['due_date']<=today+timedelta(days=7) else 5)
+    plan.append({'invoice_id':inv['id'],'invoice_no':inv['invoice_no'],'supplier_code':inv['supplier_code'],
+     'due_date':inv['due_date'],'open_balance':round(balance,2),'proposed_amount':round(amount,2),'priority':priority})
+    scheduled_total+=amount
+    if remaining is not None:remaining-=amount
+   return {'as_of':today,'horizon_end':end,'budget':budget,'proposed_total':round(scheduled_total,2),
+    'remaining_budget':None if remaining is None else round(max(0,remaining),2),'plan':plan,
+    'note':'advisory prioritization only; no payment is created or transmitted'}
 
  @app.post('/v1/procurement/invoices/{invoice_id}/make-payable')
  def make_payable(invoice_id:str,authorization:str|None=Header(None)):

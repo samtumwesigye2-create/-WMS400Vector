@@ -23,6 +23,14 @@ def init_mm_transactions(conn):
    scheduled_date DATE NOT NULL,scheduled_amount NUMERIC NOT NULL CHECK(scheduled_amount>0),
    priority INTEGER NOT NULL DEFAULT 5 CHECK(priority BETWEEN 1 AND 10),
    status TEXT NOT NULL,created_by TEXT NULL,created_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL)""")
+  c.execute("""CREATE TABLE IF NOT EXISTS vector_payment_runs(
+   id UUID PRIMARY KEY,run_no TEXT UNIQUE NOT NULL,run_date DATE NOT NULL,total_amount NUMERIC NOT NULL DEFAULT 0,
+   item_count INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,created_by TEXT NULL,created_at TIMESTAMPTZ NOT NULL,
+   approved_at TIMESTAMPTZ NULL,ready_at TIMESTAMPTZ NULL)""")
+  c.execute("""CREATE TABLE IF NOT EXISTS vector_payment_run_items(
+   id UUID PRIMARY KEY,run_id UUID NOT NULL,invoice_id UUID NOT NULL,supplier_code TEXT NOT NULL,
+   amount NUMERIC NOT NULL CHECK(amount>0),scheduled_date DATE NOT NULL,status TEXT NOT NULL,
+   created_at TIMESTAMPTZ NOT NULL,UNIQUE(run_id,invoice_id))""")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_payments(
    id UUID PRIMARY KEY,payment_no TEXT UNIQUE NOT NULL,invoice_id UUID NOT NULL,
    po_id UUID NOT NULL,supplier_code TEXT NOT NULL,amount NUMERIC NOT NULL CHECK(amount>0),
@@ -49,6 +57,7 @@ class ReversalIn(BaseModel):reason:str
 class StatementIn(BaseModel):supplier_code:str;statement_balance:float
 class PaymentTermsIn(BaseModel):terms_days:int=Field(ge=0,le=3650);description:str=''
 class PaymentScheduleIn(BaseModel):scheduled_date:date;scheduled_amount:float=Field(gt=0);priority:int=Field(default=5,ge=1,le=10)
+class PaymentRunIn(BaseModel):run_date:date|None=None
 
 def _po_totals(c,po_id):
  po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s FOR UPDATE',(po_id,)).fetchone()
@@ -254,6 +263,72 @@ def install_mm_transaction_routes(app,conn,auth):
    return {'as_of':today,'horizon_end':end,'budget':budget,'proposed_total':round(scheduled_total,2),
     'remaining_budget':None if remaining is None else round(max(0,remaining),2),'plan':plan,
     'note':'advisory prioritization only; no payment is created or transmitted'}
+
+ @app.post('/v1/procurement/payment-runs',status_code=201)
+ def create_payment_run(b:PaymentRunIn,authorization:str|None=Header(None)):
+  principal=auth('vector.payables.write',authorization);rdate=b.run_date or date.today()
+  with conn() as c:
+   schedules=c.execute("""SELECT ps.*,si.payment_status,si.status invoice_status,si.match_status
+    FROM vector_payment_schedules ps JOIN vector_supplier_invoices si ON si.id=ps.invoice_id
+    WHERE ps.status='scheduled' AND ps.scheduled_date<=%s
+    ORDER BY ps.scheduled_date,ps.priority,si.due_date""",(rdate,)).fetchall()
+   if not schedules:raise HTTPException(409,'no_eligible_scheduled_payments')
+   run_id=str(uuid4());run_no='RUN-'+now().strftime('%Y%m%d%H%M%S%f');total=0.0;count=0
+   c.execute("""INSERT INTO vector_payment_runs(id,run_no,run_date,total_amount,item_count,status,created_by,created_at)
+    VALUES(%s,%s,%s,0,0,'draft',%s,%s)""",(run_id,run_no,rdate,str(principal),now()))
+   for s in schedules:
+    if s['invoice_status']!='verified' or s['match_status']!='matched' or s['payment_status'] not in ('payable','partially_paid'):continue
+    inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(s['invoice_id'],)).fetchone()
+    net=_invoice_net_amount(c,inv['id'],inv['amount']);paid=_payment_net(c,inv['id']);balance=max(0,net-paid)
+    amount=min(float(s['scheduled_amount']),balance)
+    if amount<=0.01:continue
+    c.execute("""INSERT INTO vector_payment_run_items VALUES(%s,%s,%s,%s,%s,%s,'draft',%s)""",
+     (str(uuid4()),run_id,inv['id'],inv['supplier_code'],amount,s['scheduled_date'],now()))
+    total+=amount;count+=1
+   if count==0:
+    c.execute('DELETE FROM vector_payment_runs WHERE id=%s',(run_id,));raise HTTPException(409,'no_payable_items_for_run')
+   c.execute("UPDATE vector_payment_runs SET total_amount=%s,item_count=%s WHERE id=%s",(total,count,run_id))
+   approval=create_approval_request(c,'PAYMENT_RUN',run_id,total,str(principal))
+   status='pending_approval' if approval else 'approved'
+   approved_at=None if approval else now()
+   run=c.execute("UPDATE vector_payment_runs SET status=%s,approved_at=%s WHERE id=%s RETURNING *",(status,approved_at,run_id)).fetchone()
+   c.execute("UPDATE vector_payment_run_items SET status=%s WHERE run_id=%s",('pending_approval' if approval else 'approved',run_id))
+   return {'payment_run':run,'approval_request':approval,'note':'batch created only; no funds transmitted'}
+
+ @app.get('/v1/procurement/payment-runs')
+ def list_payment_runs(status:str|None=None,authorization:str|None=Header(None)):
+  auth('vector.payables.read',authorization)
+  with conn() as c:
+   if status:return c.execute('SELECT * FROM vector_payment_runs WHERE status=%s ORDER BY created_at DESC',(status,)).fetchall()
+   return c.execute('SELECT * FROM vector_payment_runs ORDER BY created_at DESC LIMIT 200').fetchall()
+
+ @app.get('/v1/procurement/payment-runs/{run_id}')
+ def get_payment_run(run_id:str,authorization:str|None=Header(None)):
+  auth('vector.payables.read',authorization)
+  with conn() as c:
+   rid=UUID(run_id);run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s',(rid,)).fetchone()
+   if not run:raise HTTPException(404,'payment_run_not_found')
+   items=c.execute("""SELECT pri.*,si.invoice_no,si.due_date,si.payment_status FROM vector_payment_run_items pri
+    JOIN vector_supplier_invoices si ON si.id=pri.invoice_id WHERE pri.run_id=%s ORDER BY pri.scheduled_date,si.due_date""",(rid,)).fetchall()
+   return {'payment_run':run,'items':items}
+
+ @app.post('/v1/procurement/payment-runs/{run_id}/ready')
+ def mark_payment_run_ready(run_id:str,authorization:str|None=Header(None)):
+  auth('vector.payables.write',authorization)
+  with conn() as c:
+   rid=UUID(run_id);run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s FOR UPDATE',(rid,)).fetchone()
+   if not run:raise HTTPException(404,'payment_run_not_found')
+   if run['status']!='approved':raise HTTPException(409,'payment_run_not_approved')
+   rows=c.execute('SELECT * FROM vector_payment_run_items WHERE run_id=%s FOR UPDATE',(rid,)).fetchall()
+   if not rows:raise HTTPException(409,'payment_run_has_no_items')
+   for item in rows:
+    inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s',(item['invoice_id'],)).fetchone()
+    if not inv or inv['payment_status'] not in ('payable','partially_paid'):raise HTTPException(409,'payment_run_contains_nonpayable_invoice')
+    balance=max(0,_invoice_net_amount(c,inv['id'],inv['amount'])-_payment_net(c,inv['id']))
+    if float(item['amount'])>balance+0.01:raise HTTPException(409,'payment_run_item_exceeds_current_balance')
+   c.execute("UPDATE vector_payment_run_items SET status='ready' WHERE run_id=%s",(rid,))
+   run=c.execute("UPDATE vector_payment_runs SET status='ready_for_bank',ready_at=%s WHERE id=%s RETURNING *",(now(),rid)).fetchone()
+   return {'payment_run':run,'note':'ready for external bank execution; VECTOR has not moved funds'}
 
  @app.post('/v1/procurement/invoices/{invoice_id}/make-payable')
  def make_payable(invoice_id:str,authorization:str|None=Header(None)):

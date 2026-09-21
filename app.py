@@ -25,7 +25,7 @@ from mm_transactions import init_mm_transactions, install_mm_transaction_routes
 from demand_classification import install_demand_classification_routes
 from release_approvals import init_release_approvals, install_release_approval_routes
 
-app=FastAPI(title='UNG-VECTOR',version='0.24.0')
+app=FastAPI(title='UNG-VECTOR',version='0.25.0')
 DB=os.getenv('DATABASE_URL','')
 JANUS_BASE_URL=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
 NEXUS_BASE_URL=os.getenv('NEXUS_BASE_URL','https://ung-nexus-production.up.railway.app').rstrip('/')
@@ -78,6 +78,7 @@ def init_db():
  init_goods_movement(conn)
  init_mm_transactions(conn)
  init_release_approvals(conn)
+init_accounting(conn)
 @app.on_event('startup')
 def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
@@ -181,4 +182,5 @@ install_demand_classification_routes(app, conn, auth)
 
 from pathlib import Path
 from ui_portal import install_ui
+from accounting import init_accounting,install_accounting_routes
 install_ui(app, Path(__file__).with_name('ui') / 'index.html', JANUS_BASE_URL)

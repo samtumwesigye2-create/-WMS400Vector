@@ -21,7 +21,7 @@ def install_acceptance_routes(app,conn,auth):
                   (sku,TAG,TAG))
                 checks.append({'stage':'material','status':'PASS'})
                 # Validate core/new enterprise schemas without inventing business records that bypass their APIs.
-                tables=['vector_inventory','vector_bom','vector_work_centers','vector_routings',
+                tables=['vector_gl_accounts','vector_journal_entries','vector_journal_lines','vector_accounting_periods','vector_payment_schedules','vector_payment_runs','vector_payment_run_items','vector_bank_execution_batches','vector_bank_execution_items','vector_supplier_payments','vector_p2p_audit_events','vector_inventory','vector_bom','vector_work_centers','vector_routings',
                   'vector_production_orders','vector_demand_forecasts','vector_sop_plans','vector_suppliers',
                   'vector_purchase_orders','vector_quality_inspections','vector_warehouse_tasks',
                   'vector_shipments','vector_returns','vector_sustainability_metrics','vector_shopfloor_events',
@@ -29,6 +29,26 @@ def install_acceptance_routes(app,conn,auth):
                 for t in tables:
                     exists=c.execute('SELECT to_regclass(%s) r',(t,)).fetchone()['r']
                     checks.append({'stage':t,'status':'PASS' if exists else 'FAIL'})
+                # Financial-integrity invariants: these are read-only production checks.
+                unbalanced=c.execute("""SELECT COUNT(*) n FROM (
+                  SELECT j.id FROM vector_journal_entries j JOIN vector_journal_lines l ON l.journal_id=j.id
+                  WHERE j.status IN ('posted','reversed') GROUP BY j.id
+                  HAVING SUM(l.debit)<>SUM(l.credit)) q""").fetchone()['n']
+                checks.append({'stage':'gl_balanced_journals','status':'PASS' if unbalanced==0 else 'FAIL','violations':unbalanced})
+                duplicate_auto=c.execute("""SELECT COUNT(*) n FROM (
+                  SELECT source_type,source_id FROM vector_journal_entries
+                  WHERE source_type IS NOT NULL AND source_id IS NOT NULL AND status='posted'
+                  GROUP BY source_type,source_id HAVING COUNT(*)>1) q""").fetchone()['n']
+                checks.append({'stage':'automatic_gl_idempotency','status':'PASS' if duplicate_auto==0 else 'FAIL','violations':duplicate_auto})
+                overpaid=c.execute("""SELECT COUNT(*) n FROM (
+                  SELECT i.id,i.amount,COALESCE(SUM(CASE WHEN p.status='posted' THEN p.amount ELSE 0 END),0) paid
+                  FROM vector_supplier_invoices i LEFT JOIN vector_supplier_payments p ON p.invoice_id=i.id
+                  GROUP BY i.id,i.amount HAVING COALESCE(SUM(CASE WHEN p.status='posted' THEN p.amount ELSE 0 END),0)>i.amount) q""").fetchone()['n']
+                checks.append({'stage':'no_gross_overpayments','status':'PASS' if overpaid==0 else 'FAIL','violations':overpaid})
+                stranded=c.execute("""SELECT COUNT(*) n FROM vector_bank_execution_batches b
+                  JOIN vector_payment_runs r ON r.id=b.run_id
+                  WHERE b.status='rejected' AND r.status NOT IN ('ready_for_bank','cancelled')""").fetchone()['n']
+                checks.append({'stage':'rejected_bank_runs_recoverable','status':'PASS' if stranded==0 else 'FAIL','violations':stranded})
                 status='PASS' if all(x['status']=='PASS' for x in checks) else 'FAIL'
                 return {'run_id':run_id,'tag':TAG,'test_sku':sku,'status':status,'checks':checks,'generated_at':_now()}
             except Exception as e:

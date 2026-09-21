@@ -7,6 +7,19 @@ router=APIRouter(prefix='/v1/inbound',tags=['inbound-receiving'])
 
 def now(): return datetime.now(timezone.utc)
 
+def validate_receipt_disposition(quantity, accepted, quarantined, damaged):
+    values=[float(quantity),float(accepted),float(quarantined),float(damaged)]
+    if any(v < 0 for v in values):
+        raise ValueError('receipt_quantities_must_be_non_negative')
+    if abs((values[1]+values[2]+values[3])-values[0]) > 1e-9:
+        raise ValueError('receipt_disposition_must_equal_quantity')
+    return True
+
+FULFILLMENT_SEQUENCE=('allocate','pick','pack','stage')
+
+def can_complete_task(sequence_no, prior_status):
+    return sequence_no <= 1 or prior_status == 'completed'
+
 class ExpectedPOIn(BaseModel):
     procure_order_id:str
     supplier_id:str
@@ -81,8 +94,10 @@ def install_inbound_workflow_routes(app,conn,auth,emit=None):
     def receive(procure_order_id:str,b:ReceiptIn,authorization:str|None=Header(None)):
         auth('vector.inventory.write',authorization);t=now()
         accepted=b.accepted_quantity if b.accepted_quantity is not None else b.quantity-b.quarantined_quantity-b.damaged_quantity
-        if accepted < 0 or accepted+b.quarantined_quantity+b.damaged_quantity != b.quantity:
-            raise HTTPException(422,'receipt_disposition_must_equal_quantity')
+        try:
+            validate_receipt_disposition(b.quantity,accepted,b.quarantined_quantity,b.damaged_quantity)
+        except ValueError as e:
+            raise HTTPException(422,str(e))
         with conn() as c:
             exp=c.execute('SELECT * FROM vector_expected_receipts WHERE procure_order_id=%s FOR UPDATE',(procure_order_id,)).fetchone()
             if not exp: raise HTTPException(404,'expected_receipt_not_found')
@@ -148,7 +163,7 @@ def install_inbound_workflow_routes(app,conn,auth,emit=None):
             stat=c.execute('SELECT COALESCE(reserved,0) reserved,COALESCE(quarantine,0) quarantine,COALESCE(damaged,0) damaged FROM vector_inventory_status WHERE sku=%s AND location_code=%s',(sku,location_code)).fetchone() or {'reserved':0,'quarantine':0,'damaged':0}
             available=float(inv['quantity'])-float(stat['reserved'])-float(stat['quarantine'])-float(stat['damaged'])
             if available<quantity: raise HTTPException(409,'insufficient_available_inventory')
-            for seq,kind in enumerate(['allocate','pick','pack','stage'],1):
+            for seq,kind in enumerate(FULFILLMENT_SEQUENCE,1):
                 tasks.append(c.execute("""INSERT INTO vector_fulfillment_tasks
                   (id,reference,task_type,sku,quantity,source_location,target_location,status,sequence_no,created_at,updated_at)
                   VALUES(%s,%s,%s,%s,%s,%s,NULL,'open',%s,%s,%s)
@@ -167,7 +182,7 @@ def install_inbound_workflow_routes(app,conn,auth,emit=None):
             if task['status']=='completed': raise HTTPException(409,'task_already_completed')
             if b.status=='completed' and task['sequence_no']>1:
                 prior=c.execute('SELECT 1 FROM vector_fulfillment_tasks WHERE reference=%s AND sku=%s AND sequence_no=%s AND status=%s',(task['reference'],task['sku'],task['sequence_no']-1,'completed')).fetchone()
-                if not prior: raise HTTPException(409,'prior_task_not_completed')
+                if not can_complete_task(task['sequence_no'],'completed' if prior else None): raise HTTPException(409,'prior_task_not_completed')
             row=c.execute('UPDATE vector_fulfillment_tasks SET status=%s,target_location=COALESCE(%s,target_location),updated_at=%s WHERE id=%s RETURNING *',(b.status,b.target_location,t,task_id)).fetchone()
             if b.status=='completed' and task['task_type']=='allocate':
                 c.execute("""INSERT INTO vector_inventory_status(sku,location_code,reserved,quarantine,damaged,updated_at)

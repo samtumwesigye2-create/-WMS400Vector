@@ -1,4 +1,4 @@
-from datetime import datetime,timezone
+from datetime import datetime,timezone,date,timedelta
 from fastapi import Header,HTTPException
 from pydantic import BaseModel,Field
 from uuid import uuid4,UUID
@@ -12,6 +12,12 @@ def init_mm_transactions(conn):
   c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_invoices(id UUID PRIMARY KEY,invoice_no TEXT UNIQUE NOT NULL,po_id UUID NOT NULL,supplier_code TEXT NOT NULL,amount NUMERIC NOT NULL,status TEXT NOT NULL,match_status TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL)""")
   c.execute("ALTER TABLE vector_supplier_invoices ADD COLUMN IF NOT EXISTS invoice_quantity NUMERIC NULL")
   c.execute("ALTER TABLE vector_supplier_invoices ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'not_payable'")
+  c.execute("ALTER TABLE vector_supplier_invoices ADD COLUMN IF NOT EXISTS invoice_date DATE NULL")
+  c.execute("ALTER TABLE vector_supplier_invoices ADD COLUMN IF NOT EXISTS due_date DATE NULL")
+  c.execute("ALTER TABLE vector_supplier_invoices ADD COLUMN IF NOT EXISTS terms_days INTEGER NOT NULL DEFAULT 30")
+  c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_payment_terms(
+   supplier_code TEXT PRIMARY KEY,terms_days INTEGER NOT NULL CHECK(terms_days>=0),
+   description TEXT NOT NULL DEFAULT '',updated_at TIMESTAMPTZ NOT NULL)""")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_payments(
    id UUID PRIMARY KEY,payment_no TEXT UNIQUE NOT NULL,invoice_id UUID NOT NULL,
    po_id UUID NOT NULL,supplier_code TEXT NOT NULL,amount NUMERIC NOT NULL CHECK(amount>0),
@@ -30,12 +36,13 @@ def init_mm_transactions(conn):
   c.execute("""CREATE TABLE IF NOT EXISTS vector_release_strategies(id UUID PRIMARY KEY,code TEXT UNIQUE NOT NULL,document_type TEXT NOT NULL,min_amount NUMERIC NOT NULL DEFAULT 0,required_approvals INTEGER NOT NULL DEFAULT 1,active BOOLEAN NOT NULL DEFAULT TRUE)""")
 
 class PR(BaseModel):sku:str;quantity:float=Field(gt=0);needed_by:str|None=None
-class Invoice(BaseModel):invoice_no:str;po_id:str;supplier_code:str;amount:float=Field(ge=0);quantity:float|None=Field(default=None,gt=0)
+class Invoice(BaseModel):invoice_no:str;po_id:str;supplier_code:str;amount:float=Field(ge=0);quantity:float|None=Field(default=None,gt=0);invoice_date:date|None=None;due_date:date|None=None
 class Agreement(BaseModel):agreement_no:str;supplier_code:str;sku:str;start_date:str;end_date:str;quantity:float=Field(gt=0)
 class PaymentIn(BaseModel):amount:float=Field(gt=0);reference:str|None=None
 class AdjustmentIn(BaseModel):adjustment_type:str;amount:float=Field(gt=0);reason:str=''
 class ReversalIn(BaseModel):reason:str
 class StatementIn(BaseModel):supplier_code:str;statement_balance:float
+class PaymentTermsIn(BaseModel):terms_days:int=Field(ge=0,le=3650);description:str=''
 
 def _po_totals(c,po_id):
  po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s FOR UPDATE',(po_id,)).fetchone()
@@ -96,10 +103,15 @@ def install_mm_transaction_routes(app,conn,auth):
    expected=invoice_qty*unit_cost
    if abs(float(b.amount)-expected)>0.01:reasons.append('invoice_value_mismatch')
    match='matched' if not reasons else '+'.join(reasons);status='verified' if not reasons else 'parked'
+   inv_date=b.invoice_date or date.today()
+   term=c.execute('SELECT terms_days FROM vector_supplier_payment_terms WHERE supplier_code=%s',(b.supplier_code,)).fetchone()
+   terms_days=int(term['terms_days']) if term else 30
+   due=b.due_date or (inv_date+timedelta(days=terms_days))
+   if due<inv_date:raise HTTPException(400,'due_date_before_invoice_date')
    row=c.execute("""INSERT INTO vector_supplier_invoices
-    (id,invoice_no,po_id,supplier_code,amount,status,match_status,created_at,invoice_quantity)
-    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
-    (str(uuid4()),b.invoice_no,po_id,b.supplier_code,b.amount,status,match,now(),invoice_qty)).fetchone()
+    (id,invoice_no,po_id,supplier_code,amount,status,match_status,created_at,invoice_quantity,payment_status,invoice_date,due_date,terms_days)
+    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'not_payable',%s,%s,%s) RETURNING *""",
+    (str(uuid4()),b.invoice_no,po_id,b.supplier_code,b.amount,status,match,now(),invoice_qty,inv_date,due,terms_days)).fetchone()
    if status=='verified':
     row=c.execute("UPDATE vector_supplier_invoices SET payment_status='awaiting_release' WHERE id=%s RETURNING *",(row['id'],)).fetchone()
    complete=False
@@ -108,6 +120,57 @@ def install_mm_transaction_routes(app,conn,auth):
    return {**row,'po_quantity':po_qty,'received_quantity':rec,'verified_invoice_quantity':total_qty,
     'verified_invoice_value':total_value,'po_value':po_value,'expected_invoice_value':expected,
     'match_reasons':reasons,'po_complete':complete}
+
+ @app.put('/v1/procurement/suppliers/{supplier_code}/payment-terms')
+ def set_payment_terms(supplier_code:str,b:PaymentTermsIn,authorization:str|None=Header(None)):
+  auth('vector.payables.write',authorization)
+  with conn() as c:
+   if not c.execute('SELECT 1 FROM vector_suppliers WHERE code=%s',(supplier_code,)).fetchone():raise HTTPException(404,'supplier_not_found')
+   return c.execute("""INSERT INTO vector_supplier_payment_terms VALUES(%s,%s,%s,%s)
+    ON CONFLICT(supplier_code) DO UPDATE SET terms_days=EXCLUDED.terms_days,description=EXCLUDED.description,updated_at=EXCLUDED.updated_at
+    RETURNING *""",(supplier_code,b.terms_days,b.description,now())).fetchone()
+
+ @app.get('/v1/procurement/suppliers/{supplier_code}/payment-terms')
+ def get_payment_terms(supplier_code:str,authorization:str|None=Header(None)):
+  auth('vector.payables.read',authorization)
+  with conn() as c:
+   row=c.execute('SELECT * FROM vector_supplier_payment_terms WHERE supplier_code=%s',(supplier_code,)).fetchone()
+   return row or {'supplier_code':supplier_code,'terms_days':30,'description':'default NET 30'}
+
+ @app.get('/v1/procurement/ap-aging')
+ def ap_aging(supplier_code:str|None=None,as_of:date|None=None,authorization:str|None=Header(None)):
+  auth('vector.payables.read',authorization);cutoff=as_of or date.today()
+  with conn() as c:
+   if supplier_code:
+    rows=c.execute("""SELECT * FROM vector_supplier_invoices WHERE status='verified' AND supplier_code=%s AND payment_status<>'paid' ORDER BY due_date""",(supplier_code,)).fetchall()
+   else:
+    rows=c.execute("""SELECT * FROM vector_supplier_invoices WHERE status='verified' AND payment_status<>'paid' ORDER BY supplier_code,due_date""").fetchall()
+   buckets={'current':0.0,'1_30':0.0,'31_60':0.0,'61_90':0.0,'91_plus':0.0};items=[];total=0.0
+   for inv in rows:
+    net=_invoice_net_amount(c,inv['id'],inv['amount']);paid=_payment_net(c,inv['id']);open_balance=max(0,net-paid)
+    if open_balance<=0.01:continue
+    due=inv['due_date'] or (inv['invoice_date'] or inv['created_at'].date())+timedelta(days=int(inv['terms_days'] or 30))
+    days=(cutoff-due).days
+    bucket='current' if days<=0 else ('1_30' if days<=30 else ('31_60' if days<=60 else ('61_90' if days<=90 else '91_plus')))
+    buckets[bucket]+=open_balance;total+=open_balance
+    items.append({'invoice_id':inv['id'],'invoice_no':inv['invoice_no'],'supplier_code':inv['supplier_code'],
+     'invoice_date':inv['invoice_date'],'due_date':due,'days_overdue':max(0,days),'bucket':bucket,'open_balance':round(open_balance,2)})
+   return {'as_of':cutoff,'supplier_code':supplier_code,'total_open_ap':round(total,2),
+    'buckets':{k:round(v,2) for k,v in buckets.items()},'invoice_count':len(items),'items':items}
+
+ @app.get('/v1/procurement/ap-overdue')
+ def ap_overdue(supplier_code:str|None=None,authorization:str|None=Header(None)):
+  auth('vector.payables.read',authorization);today=date.today()
+  with conn() as c:
+   q="""SELECT * FROM vector_supplier_invoices WHERE status='verified' AND payment_status<>'paid' AND due_date<CURRENT_DATE"""
+   params=()
+   if supplier_code:q+=" AND supplier_code=%s";params=(supplier_code,)
+   rows=c.execute(q+" ORDER BY due_date",params).fetchall();out=[]
+   for inv in rows:
+    net=_invoice_net_amount(c,inv['id'],inv['amount']);paid=_payment_net(c,inv['id']);balance=max(0,net-paid)
+    if balance>0.01:out.append({'invoice_id':inv['id'],'invoice_no':inv['invoice_no'],'supplier_code':inv['supplier_code'],
+     'due_date':inv['due_date'],'days_overdue':(today-inv['due_date']).days,'open_balance':round(balance,2)})
+   return {'as_of':today,'overdue_count':len(out),'overdue_total':round(sum(x['open_balance'] for x in out),2),'items':out}
 
  @app.post('/v1/procurement/invoices/{invoice_id}/make-payable')
  def make_payable(invoice_id:str,authorization:str|None=Header(None)):

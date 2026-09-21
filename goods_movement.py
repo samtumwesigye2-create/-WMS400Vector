@@ -50,7 +50,7 @@ def install_goods_movement_routes(app,conn,auth):
    if b.movement_type=='101':
     po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s FOR UPDATE',(po_uuid,)).fetchone()
     if not po:raise HTTPException(404,'purchase_order_not_found')
-    if po['status'] in ('pending_approval','rejected'):raise HTTPException(409,'purchase_order_not_released')
+    if po['status'] in ('pending_approval','rejected','cancelled','complete'):raise HTTPException(409,'purchase_order_not_receivable')
     if po['sku']!=b.sku:raise HTTPException(409,'po_sku_mismatch')
     received=float(c.execute("SELECT COALESCE(sum(CASE WHEN movement_type='101' THEN quantity WHEN movement_type='102' THEN -quantity ELSE 0 END),0) q FROM vector_material_documents WHERE po_id=%s AND status='posted'",(po_uuid,)).fetchone()['q'])
     if received+b.quantity>float(po['quantity']):raise HTTPException(409,'receipt_exceeds_po_quantity')

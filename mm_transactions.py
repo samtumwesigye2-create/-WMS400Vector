@@ -1,4 +1,5 @@
 from datetime import datetime,timezone,date,timedelta
+from decimal import Decimal,ROUND_HALF_UP,InvalidOperation
 from fastapi import Header,HTTPException
 from pydantic import BaseModel,Field
 from uuid import uuid4,UUID
@@ -6,6 +7,14 @@ from release_approvals import create_approval_request
 import json
 
 def now():return datetime.now(timezone.utc)
+
+def money(v):
+ try:return Decimal(str(v)).quantize(Decimal('0.01'),rounding=ROUND_HALF_UP)
+ except (InvalidOperation,ValueError,TypeError):raise HTTPException(400,'invalid_money_amount')
+
+def uid(v,label='id'):
+ try:return UUID(str(v))
+ except (ValueError,TypeError,AttributeError):raise HTTPException(400,f'invalid_{label}')
 
 def init_mm_transactions(conn):
  with conn() as c:
@@ -16,6 +25,10 @@ def init_mm_transactions(conn):
   c.execute("ALTER TABLE vector_supplier_invoices ADD COLUMN IF NOT EXISTS invoice_date DATE NULL")
   c.execute("ALTER TABLE vector_supplier_invoices ADD COLUMN IF NOT EXISTS due_date DATE NULL")
   c.execute("ALTER TABLE vector_supplier_invoices ADD COLUMN IF NOT EXISTS terms_days INTEGER NOT NULL DEFAULT 30")
+  c.execute("""UPDATE vector_supplier_invoices SET invoice_date=COALESCE(invoice_date,created_at::date)
+   WHERE invoice_date IS NULL""")
+  c.execute("""UPDATE vector_supplier_invoices SET due_date=COALESCE(invoice_date,created_at::date)+(COALESCE(terms_days,30)*INTERVAL '1 day')
+   WHERE due_date IS NULL""")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_payment_terms(
    supplier_code TEXT PRIMARY KEY,terms_days INTEGER NOT NULL CHECK(terms_days>=0),
    description TEXT NOT NULL DEFAULT '',updated_at TIMESTAMPTZ NOT NULL)""")
@@ -95,15 +108,15 @@ def _invoice_net_amount(c,invoice_id,base_amount):
  a=c.execute("""SELECT COALESCE(sum(CASE WHEN adjustment_type='credit_memo' AND status='posted' THEN amount
  WHEN adjustment_type='debit_adjustment' AND status='posted' THEN -amount ELSE 0 END),0) net_credit
  FROM vector_supplier_adjustments WHERE invoice_id=%s""",(invoice_id,)).fetchone()['net_credit']
- return max(0,float(base_amount)-float(a))
+ return max(Decimal('0.00'),money(base_amount)-money(a))
 
 def _payment_net(c,invoice_id):
- p=float(c.execute("""SELECT COALESCE(sum(amount),0) total FROM vector_supplier_payments
+ p=money(c.execute("""SELECT COALESCE(sum(amount),0) total FROM vector_supplier_payments
  WHERE invoice_id=%s AND status='posted'""",(invoice_id,)).fetchone()['total'])
- r=float(c.execute("""SELECT COALESCE(sum(pr.amount),0) total FROM vector_payment_reversals pr
+ r=money(c.execute("""SELECT COALESCE(sum(pr.amount),0) total FROM vector_payment_reversals pr
  JOIN vector_supplier_payments p ON p.id=pr.payment_id
  WHERE p.invoice_id=%s AND pr.status='posted'""",(invoice_id,)).fetchone()['total'])
- return max(0,p-r)
+ return max(Decimal('0.00'),p-r)
 
 def _maybe_complete(c,po_id):
  po,received,invoiced_qty,invoiced_value=_po_totals(c,po_id)
@@ -127,7 +140,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def invoice(b:Invoice,authorization:str|None=Header(None)):
   auth('vector.procurement.write',authorization)
   with conn() as c:
-   po_id=UUID(b.po_id);po,rec,prior_qty,prior_value=_po_totals(c,po_id)
+   po_id=uid(b.po_id,'po_id');po,rec,prior_qty,prior_value=_po_totals(c,po_id)
    if po['status'] in ('pending_approval','rejected','cancelled','complete'):raise HTTPException(409,'purchase_order_not_invoiceable')
    if po['supplier_code']!=b.supplier_code:raise HTTPException(409,'supplier_po_mismatch')
    po_qty=float(po['quantity']);unit_cost=float(po['unit_cost']);po_value=po_qty*unit_cost
@@ -237,9 +250,13 @@ def install_mm_transaction_routes(app,conn,auth):
  def schedule_payment(invoice_id:str,b:PaymentScheduleIn,authorization:str|None=Header(None)):
   principal=auth('vector.payables.write',authorization)
   with conn() as c:
-   iid=UUID(invoice_id);inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
+   iid=uid(invoice_id,'invoice_id');inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
    if not inv:raise HTTPException(404,'supplier_invoice_not_found')
    if inv['status']!='verified' or inv['match_status']!='matched':raise HTTPException(409,'invoice_not_verified_and_matched')
+   if inv['payment_status'] not in ('payable','partially_paid'):raise HTTPException(409,'invoice_not_released_for_payment')
+   active=c.execute("""SELECT 1 FROM vector_payment_run_items pri JOIN vector_payment_runs pr ON pr.id=pri.run_id
+    WHERE pri.invoice_id=%s AND pr.status IN ('pending_approval','approved','ready_for_bank','handed_off') LIMIT 1""",(iid,)).fetchone()
+   if active:raise HTTPException(409,'invoice_already_in_active_payment_run')
    net=_invoice_net_amount(c,iid,inv['amount']);paid=_payment_net(c,iid);balance=max(0,net-paid)
    if balance<=0.01:raise HTTPException(409,'invoice_has_no_open_balance')
    if b.scheduled_amount>balance+0.01:raise HTTPException(409,{'error':'scheduled_amount_exceeds_open_balance','open_balance':balance})
@@ -302,6 +319,9 @@ def install_mm_transaction_routes(app,conn,auth):
     VALUES(%s,%s,%s,0,0,'draft',%s,%s)""",(run_id,run_no,rdate,str(principal),now()))
    for s in schedules:
     if s['invoice_status']!='verified' or s['match_status']!='matched' or s['payment_status'] not in ('payable','partially_paid'):continue
+    active=c.execute("""SELECT 1 FROM vector_payment_run_items pri JOIN vector_payment_runs pr ON pr.id=pri.run_id
+     WHERE pri.invoice_id=%s AND pr.status IN ('pending_approval','approved','ready_for_bank','handed_off') LIMIT 1""",(s['invoice_id'],)).fetchone()
+    if active:continue
     inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(s['invoice_id'],)).fetchone()
     net=_invoice_net_amount(c,inv['id'],inv['amount']);paid=_payment_net(c,inv['id']);balance=max(0,net-paid)
     amount=min(float(s['scheduled_amount']),balance)
@@ -331,7 +351,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def get_payment_run(run_id:str,authorization:str|None=Header(None)):
   auth('vector.payables.read',authorization)
   with conn() as c:
-   rid=UUID(run_id);run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s',(rid,)).fetchone()
+   rid=uid(run_id,'run_id');run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s',(rid,)).fetchone()
    if not run:raise HTTPException(404,'payment_run_not_found')
    items=c.execute("""SELECT pri.*,si.invoice_no,si.due_date,si.payment_status FROM vector_payment_run_items pri
     JOIN vector_supplier_invoices si ON si.id=pri.invoice_id WHERE pri.run_id=%s ORDER BY pri.scheduled_date,si.due_date""",(rid,)).fetchall()
@@ -341,7 +361,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def mark_payment_run_ready(run_id:str,authorization:str|None=Header(None)):
   auth('vector.payables.write',authorization)
   with conn() as c:
-   rid=UUID(run_id);run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s FOR UPDATE',(rid,)).fetchone()
+   rid=uid(run_id,'run_id');run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s FOR UPDATE',(rid,)).fetchone()
    if not run:raise HTTPException(404,'payment_run_not_found')
    if run['status']!='approved':raise HTTPException(409,'payment_run_not_approved')
    rows=c.execute('SELECT * FROM vector_payment_run_items WHERE run_id=%s FOR UPDATE',(rid,)).fetchall()
@@ -359,7 +379,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def bank_handoff(run_id:str,authorization:str|None=Header(None)):
   principal=auth('vector.payables.write',authorization)
   with conn() as c:
-   rid=UUID(run_id);run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s FOR UPDATE',(rid,)).fetchone()
+   rid=uid(run_id,'run_id');run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s FOR UPDATE',(rid,)).fetchone()
    if not run:raise HTTPException(404,'payment_run_not_found')
    existing=c.execute('SELECT * FROM vector_bank_execution_batches WHERE run_id=%s',(rid,)).fetchone()
    if existing:return {'batch':existing,'instructions':c.execute('SELECT * FROM vector_bank_execution_items WHERE batch_id=%s ORDER BY id',(existing['id'],)).fetchall(),'note':'existing immutable handoff returned; no funds transmitted'}
@@ -409,7 +429,7 @@ def install_mm_transaction_routes(app,conn,auth):
    if batch['status']!='accepted':raise HTTPException(409,'bank_execution_not_accepted')
    for ack in items:
     if ack.status not in ('settled','rejected'):raise HTTPException(400,'item_status_must_be_settled_or_rejected')
-    riid=UUID(ack.run_item_id)
+    riid=uid(ack.run_item_id,'run_item_id')
     bei=c.execute('SELECT * FROM vector_bank_execution_items WHERE batch_id=%s AND run_item_id=%s FOR UPDATE',(batch['id'],riid)).fetchone()
     if not bei:raise HTTPException(404,'bank_execution_item_not_found')
     if bei['status'] in ('settled','rejected'):continue
@@ -441,7 +461,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def p2p_timeline(po_id:str,authorization:str|None=Header(None)):
   auth('vector.procurement.read',authorization)
   with conn() as c:
-   pid=UUID(po_id);po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s',(pid,)).fetchone()
+   pid=uid(po_id,'po_id');po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s',(pid,)).fetchone()
    if not po:raise HTTPException(404,'purchase_order_not_found')
    receipts=c.execute("SELECT * FROM vector_material_documents WHERE po_id=%s ORDER BY posted_at",(pid,)).fetchall()
    invoices=c.execute("SELECT * FROM vector_supplier_invoices WHERE po_id=%s ORDER BY created_at",(pid,)).fetchall()
@@ -483,7 +503,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def make_payable(invoice_id:str,authorization:str|None=Header(None)):
   auth('vector.payables.write',authorization)
   with conn() as c:
-   iid=UUID(invoice_id);inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
+   iid=uid(invoice_id,'invoice_id');inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
    if not inv:raise HTTPException(404,'supplier_invoice_not_found')
    if inv['status']!='verified' or inv['match_status']!='matched':raise HTTPException(409,'invoice_not_verified_and_matched')
    if inv['payment_status'] in ('paid','partially_paid','payable'):return inv
@@ -493,7 +513,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def pay_invoice(invoice_id:str,b:PaymentIn,authorization:str|None=Header(None)):
   principal=auth('vector.payables.write',authorization)
   with conn() as c:
-   iid=UUID(invoice_id);inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
+   iid=uid(invoice_id,'invoice_id');inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
    if not inv:raise HTTPException(404,'supplier_invoice_not_found')
    if inv['status']!='verified' or inv['match_status']!='matched':raise HTTPException(409,'invoice_not_verified_and_matched')
    if inv['payment_status'] not in ('payable','partially_paid'):raise HTTPException(409,'invoice_not_payable')
@@ -518,7 +538,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def payment_status(invoice_id:str,authorization:str|None=Header(None)):
   auth('vector.payables.read',authorization)
   with conn() as c:
-   iid=UUID(invoice_id);inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s',(iid,)).fetchone()
+   iid=uid(invoice_id,'invoice_id');inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s',(iid,)).fetchone()
    if not inv:raise HTTPException(404,'supplier_invoice_not_found')
    paid=_payment_net(c,iid);net_amount=_invoice_net_amount(c,iid,inv['amount'])
    payments=c.execute("SELECT * FROM vector_supplier_payments WHERE invoice_id=%s ORDER BY paid_at",(iid,)).fetchall()
@@ -533,7 +553,7 @@ def install_mm_transaction_routes(app,conn,auth):
   principal=auth('vector.payables.write',authorization)
   if b.adjustment_type not in ('credit_memo','debit_adjustment'):raise HTTPException(400,'invalid_adjustment_type')
   with conn() as c:
-   iid=UUID(invoice_id);inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
+   iid=uid(invoice_id,'invoice_id');inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
    if not inv:raise HTTPException(404,'supplier_invoice_not_found')
    if inv['status']!='verified':raise HTTPException(409,'invoice_not_verified')
    current_net=_invoice_net_amount(c,iid,inv['amount']);paid=_payment_net(c,iid)
@@ -582,9 +602,9 @@ def install_mm_transaction_routes(app,conn,auth):
  def lifecycle(po_id:str,authorization:str|None=Header(None)):
   auth('vector.procurement.read',authorization)
   with conn() as c:
-   po,received,invoiced_qty,invoiced_value=_po_totals(c,UUID(po_id))
+   po,received,invoiced_qty,invoiced_value=_po_totals(c,uid(po_id,'po_id'))
    po_qty=float(po['quantity']);po_value=po_qty*float(po['unit_cost'])
-   paid=float(c.execute("SELECT COALESCE(sum(p.amount),0) total FROM vector_supplier_payments p WHERE p.po_id=%s AND p.status='posted'",(UUID(po_id),)).fetchone()['total'])
+   paid=float(c.execute("SELECT COALESCE(sum(p.amount),0) total FROM vector_supplier_payments p WHERE p.po_id=%s AND p.status='posted'",(uid(po_id,'po_id'),)).fetchone()['total'])
    return {'purchase_order':po,'ordered_quantity':po_qty,'received_quantity':received,
     'remaining_to_receive':max(0,po_qty-received),'verified_invoice_quantity':invoiced_qty,
     'remaining_to_invoice':max(0,po_qty-invoiced_qty),'po_value':po_value,
@@ -595,7 +615,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def cancel_po(po_id:str,authorization:str|None=Header(None)):
   auth('vector.procurement.write',authorization)
   with conn() as c:
-   pid=UUID(po_id);po,received,invoiced_qty,invoiced_value=_po_totals(c,pid)
+   pid=uid(po_id,'po_id');po,received,invoiced_qty,invoiced_value=_po_totals(c,pid)
    if po['status'] in ('complete','cancelled'):raise HTTPException(409,'purchase_order_not_cancellable')
    if received>0 or invoiced_qty>0 or invoiced_value>0:raise HTTPException(409,'purchase_order_has_posted_activity')
    row=c.execute("UPDATE vector_purchase_orders SET status='cancelled' WHERE id=%s RETURNING *",(pid,)).fetchone()
@@ -606,7 +626,7 @@ def install_mm_transaction_routes(app,conn,auth):
  def close_po(po_id:str,authorization:str|None=Header(None)):
   auth('vector.procurement.write',authorization)
   with conn() as c:
-   pid=UUID(po_id);complete,received,invoiced_qty,invoiced_value,po_qty,po_value=_maybe_complete(c,pid)
+   pid=uid(po_id,'po_id');complete,received,invoiced_qty,invoiced_value,po_qty,po_value=_maybe_complete(c,pid)
    if not complete:raise HTTPException(409,{'error':'purchase_order_not_fully_received_and_invoiced','received':received,'ordered':po_qty,'invoiced_quantity':invoiced_qty,'invoiced_value':invoiced_value,'po_value':po_value})
    return c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s',(pid,)).fetchone()
 

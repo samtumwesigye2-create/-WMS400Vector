@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from fastapi import Header, HTTPException
 from pydantic import BaseModel, Field
+from release_approvals import create_approval_request
 
 def _now(): return datetime.now(timezone.utc)
 
@@ -142,8 +143,14 @@ def install_enterprise_suite_routes(app,conn,auth):
 
     @app.post('/v1/procurement/purchase-orders',status_code=201)
     def po(b:POIn,authorization:str|None=Header(None)):
-        auth('vector.procurement.write',authorization)
-        with conn() as c:return c.execute("INSERT INTO vector_purchase_orders VALUES(%s,%s,%s,%s,%s,%s,'open',%s,%s) RETURNING *",(str(uuid4()),b.po_number,b.supplier_code,b.sku,b.quantity,b.unit_cost,b.expected_date,_now())).fetchone()
+        principal=auth('vector.procurement.write',authorization)
+        with conn() as c:
+            po_id=str(uuid4()); amount=b.quantity*b.unit_cost
+            strategy=c.execute("SELECT * FROM vector_release_strategies WHERE active=TRUE AND document_type='PO' AND min_amount<=%s ORDER BY min_amount DESC LIMIT 1",(amount,)).fetchone()
+            status='pending_approval' if strategy else 'open'
+            row=c.execute("INSERT INTO vector_purchase_orders VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",(po_id,b.po_number,b.supplier_code,b.sku,b.quantity,b.unit_cost,status,b.expected_date,_now())).fetchone()
+            approval=create_approval_request(c,'PO',po_id,amount,str(principal)) if strategy else None
+            return {'purchase_order':row,'approval_request':approval}
 
     @app.post('/v1/quality/inspections',status_code=201)
     def inspection(b:InspectionIn,authorization:str|None=Header(None)):

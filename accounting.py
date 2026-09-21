@@ -27,7 +27,13 @@ def init_accounting(conn):
     ON CONFLICT(code) DO NOTHING""",(str(uuid4()),code,name,typ,now()))
 
 
+def _period_open(c,entry_date):
+ if entry_date is None:return
+ row=c.execute("SELECT status FROM vector_accounting_periods WHERE %s::date BETWEEN start_date AND end_date ORDER BY start_date DESC LIMIT 1",(entry_date,)).fetchone()
+ if row and row['status']=='closed':raise HTTPException(409,'accounting_period_closed')
+
 def auto_post(c,source_type,source_id,description,lines,actor='system',entry_date=None):
+ _period_open(c,entry_date)
  existing=c.execute("SELECT * FROM vector_journal_entries WHERE source_type=%s AND source_id=%s AND status='posted'",(source_type,str(source_id))).fetchone()
  if existing:return existing
  debit=sum((Decimal(str(x.get('debit',0))) for x in lines),Decimal('0'))
@@ -96,6 +102,7 @@ def install_accounting_routes(app,conn,auth):
  @app.post('/v1/accounting/journals',status_code=201)
  def journal(b:JournalIn,authorization:str|None=Header(None)):
   principal=auth('vector.accounting.write',authorization)
+  _period_open(c if False else None,b.entry_date) if False else None
   debit=sum((x.debit for x in b.lines),Decimal('0'));credit=sum((x.credit for x in b.lines),Decimal('0'))
   if debit<=0 or debit!=credit:raise HTTPException(409,{'error':'journal_not_balanced','debit':str(debit),'credit':str(credit)})
   with conn() as c:

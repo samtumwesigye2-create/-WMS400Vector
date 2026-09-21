@@ -31,6 +31,15 @@ def init_mm_transactions(conn):
    id UUID PRIMARY KEY,run_id UUID NOT NULL,invoice_id UUID NOT NULL,supplier_code TEXT NOT NULL,
    amount NUMERIC NOT NULL CHECK(amount>0),scheduled_date DATE NOT NULL,status TEXT NOT NULL,
    created_at TIMESTAMPTZ NOT NULL,UNIQUE(run_id,invoice_id))""")
+  c.execute("""CREATE TABLE IF NOT EXISTS vector_bank_execution_batches(
+   id UUID PRIMARY KEY,execution_ref TEXT UNIQUE NOT NULL,run_id UUID NOT NULL UNIQUE,
+   total_amount NUMERIC NOT NULL,item_count INTEGER NOT NULL,status TEXT NOT NULL,
+   created_by TEXT NULL,created_at TIMESTAMPTZ NOT NULL,acknowledged_at TIMESTAMPTZ NULL,
+   bank_reference TEXT NULL,bank_message TEXT NULL)""")
+  c.execute("""CREATE TABLE IF NOT EXISTS vector_bank_execution_items(
+   id UUID PRIMARY KEY,batch_id UUID NOT NULL,run_item_id UUID NOT NULL UNIQUE,invoice_id UUID NOT NULL,
+   supplier_code TEXT NOT NULL,amount NUMERIC NOT NULL,status TEXT NOT NULL,
+   bank_reference TEXT NULL,bank_message TEXT NULL,updated_at TIMESTAMPTZ NOT NULL)""")
   c.execute("""CREATE TABLE IF NOT EXISTS vector_supplier_payments(
    id UUID PRIMARY KEY,payment_no TEXT UNIQUE NOT NULL,invoice_id UUID NOT NULL,
    po_id UUID NOT NULL,supplier_code TEXT NOT NULL,amount NUMERIC NOT NULL CHECK(amount>0),
@@ -58,6 +67,8 @@ class StatementIn(BaseModel):supplier_code:str;statement_balance:float
 class PaymentTermsIn(BaseModel):terms_days:int=Field(ge=0,le=3650);description:str=''
 class PaymentScheduleIn(BaseModel):scheduled_date:date;scheduled_amount:float=Field(gt=0);priority:int=Field(default=5,ge=1,le=10)
 class PaymentRunIn(BaseModel):run_date:date|None=None
+class BankAckIn(BaseModel):status:str;bank_reference:str|None=None;message:str=''
+class BankItemAckIn(BaseModel):run_item_id:str;status:str;bank_reference:str|None=None;message:str=''
 
 def _po_totals(c,po_id):
  po=c.execute('SELECT * FROM vector_purchase_orders WHERE id=%s FOR UPDATE',(po_id,)).fetchone()
@@ -329,6 +340,94 @@ def install_mm_transaction_routes(app,conn,auth):
    c.execute("UPDATE vector_payment_run_items SET status='ready' WHERE run_id=%s",(rid,))
    run=c.execute("UPDATE vector_payment_runs SET status='ready_for_bank',ready_at=%s WHERE id=%s RETURNING *",(now(),rid)).fetchone()
    return {'payment_run':run,'note':'ready for external bank execution; VECTOR has not moved funds'}
+
+ @app.post('/v1/procurement/payment-runs/{run_id}/bank-handoff',status_code=201)
+ def bank_handoff(run_id:str,authorization:str|None=Header(None)):
+  principal=auth('vector.payables.write',authorization)
+  with conn() as c:
+   rid=UUID(run_id);run=c.execute('SELECT * FROM vector_payment_runs WHERE id=%s FOR UPDATE',(rid,)).fetchone()
+   if not run:raise HTTPException(404,'payment_run_not_found')
+   existing=c.execute('SELECT * FROM vector_bank_execution_batches WHERE run_id=%s',(rid,)).fetchone()
+   if existing:return {'batch':existing,'instructions':c.execute('SELECT * FROM vector_bank_execution_items WHERE batch_id=%s ORDER BY id',(existing['id'],)).fetchall(),'note':'existing immutable handoff returned; no funds transmitted'}
+   if run['status']!='ready_for_bank':raise HTTPException(409,'payment_run_not_ready_for_bank')
+   items=c.execute("SELECT * FROM vector_payment_run_items WHERE run_id=%s AND status='ready' ORDER BY id FOR UPDATE",(rid,)).fetchall()
+   if not items:raise HTTPException(409,'payment_run_has_no_ready_items')
+   bid=str(uuid4());eref='VECBANK-'+now().strftime('%Y%m%d%H%M%S%f')
+   batch=c.execute("""INSERT INTO vector_bank_execution_batches VALUES(%s,%s,%s,%s,%s,'generated',%s,%s,NULL,NULL,NULL) RETURNING *""",
+    (bid,eref,rid,run['total_amount'],run['item_count'],str(principal),now())).fetchone()
+   instructions=[]
+   for item in items:
+    inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(item['invoice_id'],)).fetchone()
+    balance=max(0,_invoice_net_amount(c,inv['id'],inv['amount'])-_payment_net(c,inv['id']))
+    if float(item['amount'])>balance+0.01:raise HTTPException(409,'bank_handoff_item_exceeds_current_balance')
+    instructions.append(c.execute("""INSERT INTO vector_bank_execution_items VALUES(%s,%s,%s,%s,%s,%s,'generated',NULL,NULL,%s) RETURNING *""",
+     (str(uuid4()),bid,item['id'],item['invoice_id'],item['supplier_code'],item['amount'],now())).fetchone())
+   c.execute("UPDATE vector_payment_run_items SET status='handed_off' WHERE run_id=%s",(rid,))
+   c.execute("UPDATE vector_payment_runs SET status='handed_off' WHERE id=%s",(rid,))
+   return {'batch':batch,'instructions':instructions,'note':'immutable execution instructions generated; VECTOR has not transmitted funds'}
+
+ @app.post('/v1/procurement/bank-executions/{execution_ref}/acknowledge')
+ def acknowledge_bank(execution_ref:str,b:BankAckIn,authorization:str|None=Header(None)):
+  auth('vector.payables.write',authorization)
+  if b.status not in ('accepted','rejected'):raise HTTPException(400,'bank_status_must_be_accepted_or_rejected')
+  with conn() as c:
+   batch=c.execute('SELECT * FROM vector_bank_execution_batches WHERE execution_ref=%s FOR UPDATE',(execution_ref,)).fetchone()
+   if not batch:raise HTTPException(404,'bank_execution_not_found')
+   if batch['status'] not in ('generated','accepted'):raise HTTPException(409,'bank_execution_already_finalized')
+   batch=c.execute("""UPDATE vector_bank_execution_batches SET status=%s,acknowledged_at=%s,bank_reference=%s,bank_message=%s
+    WHERE id=%s RETURNING *""",(b.status,now(),b.bank_reference,b.message,batch['id'])).fetchone()
+   if b.status=='rejected':
+    c.execute("UPDATE vector_bank_execution_items SET status='rejected',bank_message=%s,updated_at=%s WHERE batch_id=%s",(b.message,now(),batch['id']))
+    c.execute("UPDATE vector_payment_run_items SET status='ready' WHERE run_id=%s",(batch['run_id'],))
+    c.execute("UPDATE vector_payment_runs SET status='ready_for_bank' WHERE id=%s",(batch['run_id'],))
+   else:
+    c.execute("UPDATE vector_bank_execution_items SET status='accepted',updated_at=%s WHERE batch_id=%s",(now(),batch['id']))
+   return batch
+
+ @app.post('/v1/procurement/bank-executions/{execution_ref}/reconcile')
+ def reconcile_bank_execution(execution_ref:str,items:list[BankItemAckIn],authorization:str|None=Header(None)):
+  principal=auth('vector.payables.write',authorization)
+  with conn() as c:
+   batch=c.execute('SELECT * FROM vector_bank_execution_batches WHERE execution_ref=%s FOR UPDATE',(execution_ref,)).fetchone()
+   if not batch:raise HTTPException(404,'bank_execution_not_found')
+   if batch['status']!='accepted':raise HTTPException(409,'bank_execution_not_accepted')
+   for ack in items:
+    if ack.status not in ('settled','rejected'):raise HTTPException(400,'item_status_must_be_settled_or_rejected')
+    riid=UUID(ack.run_item_id)
+    bei=c.execute('SELECT * FROM vector_bank_execution_items WHERE batch_id=%s AND run_item_id=%s FOR UPDATE',(batch['id'],riid)).fetchone()
+    if not bei:raise HTTPException(404,'bank_execution_item_not_found')
+    if bei['status'] in ('settled','rejected'):continue
+    if ack.status=='settled':
+     inv=c.execute('SELECT * FROM vector_supplier_invoices WHERE id=%s FOR UPDATE',(bei['invoice_id'],)).fetchone()
+     balance=max(0,_invoice_net_amount(c,inv['id'],inv['amount'])-_payment_net(c,inv['id']))
+     amount=min(float(bei['amount']),balance)
+     if amount<=0.01:raise HTTPException(409,'invoice_has_no_reconcilable_balance')
+     pno='PAY-'+now().strftime('%Y%m%d%H%M%S%f')
+     c.execute("""INSERT INTO vector_supplier_payments VALUES(%s,%s,%s,%s,%s,%s,%s,'posted',%s,%s)""",
+      (str(uuid4()),pno,inv['id'],inv['po_id'],inv['supplier_code'],amount,ack.bank_reference or execution_ref,str(principal),now()))
+     paid=_payment_net(c,inv['id']);net=_invoice_net_amount(c,inv['id'],inv['amount']);pstatus='paid' if net-paid<=0.01 else 'partially_paid'
+     c.execute('UPDATE vector_supplier_invoices SET payment_status=%s WHERE id=%s',(pstatus,inv['id']))
+     c.execute("UPDATE vector_payment_run_items SET status='settled' WHERE id=%s",(riid,))
+    else:c.execute("UPDATE vector_payment_run_items SET status='rejected' WHERE id=%s",(riid,))
+    c.execute("""UPDATE vector_bank_execution_items SET status=%s,bank_reference=%s,bank_message=%s,updated_at=%s WHERE id=%s""",
+     (ack.status,ack.bank_reference,ack.message,now(),bei['id']))
+   states=c.execute('SELECT status,count(*) n FROM vector_bank_execution_items WHERE batch_id=%s GROUP BY status',(batch['id'],)).fetchall()
+   pending=sum(int(x['n']) for x in states if x['status'] not in ('settled','rejected'))
+   if pending==0:
+    settled=sum(int(x['n']) for x in states if x['status']=='settled');rejected=sum(int(x['n']) for x in states if x['status']=='rejected')
+    final='settled' if rejected==0 else ('rejected' if settled==0 else 'partially_settled')
+    c.execute('UPDATE vector_bank_execution_batches SET status=%s WHERE id=%s',(final,batch['id']))
+    c.execute('UPDATE vector_payment_runs SET status=%s WHERE id=%s',(final,batch['run_id']))
+   return {'execution_ref':execution_ref,'states':states,'pending_items':pending,'note':'reconciliation records externally reported bank results'}
+
+ @app.get('/v1/procurement/bank-executions/{execution_ref}')
+ def bank_execution_status(execution_ref:str,authorization:str|None=Header(None)):
+  auth('vector.payables.read',authorization)
+  with conn() as c:
+   batch=c.execute('SELECT * FROM vector_bank_execution_batches WHERE execution_ref=%s',(execution_ref,)).fetchone()
+   if not batch:raise HTTPException(404,'bank_execution_not_found')
+   items=c.execute('SELECT * FROM vector_bank_execution_items WHERE batch_id=%s ORDER BY id',(batch['id'],)).fetchall()
+   return {'batch':batch,'items':items}
 
  @app.post('/v1/procurement/invoices/{invoice_id}/make-payable')
  def make_payable(invoice_id:str,authorization:str|None=Header(None)):

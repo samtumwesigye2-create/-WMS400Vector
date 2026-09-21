@@ -51,6 +51,9 @@ def _release_document(c,r):
   c.execute("UPDATE vector_purchase_requisitions SET status='open' WHERE id=%s",(r['document_id'],))
  elif r['document_type']=='EXCEPTION':
   c.execute("UPDATE vector_exceptions SET status='approved' WHERE id=%s",(r['document_id'],))
+ elif r['document_type']=='PAYMENT_RUN':
+  c.execute("UPDATE vector_payment_runs SET status='approved',approved_at=%s WHERE id=%s",(now(),r['document_id'],))
+  c.execute("UPDATE vector_payment_run_items SET status='approved' WHERE run_id=%s",(r['document_id'],))
 
 def _reject_document(c,r):
  if r['document_type']=='PO':
@@ -59,6 +62,9 @@ def _reject_document(c,r):
   c.execute("UPDATE vector_purchase_requisitions SET status='rejected' WHERE id=%s",(r['document_id'],))
  elif r['document_type']=='EXCEPTION':
   c.execute("UPDATE vector_exceptions SET status='rejected' WHERE id=%s",(r['document_id'],))
+ elif r['document_type']=='PAYMENT_RUN':
+  c.execute("UPDATE vector_payment_runs SET status='rejected' WHERE id=%s",(r['document_id'],))
+  c.execute("UPDATE vector_payment_run_items SET status='rejected' WHERE run_id=%s",(r['document_id'],))
 
 def install_release_approval_routes(app,conn,auth):
  @app.post('/v1/approvals/exceptions',status_code=201)
@@ -76,7 +82,7 @@ def install_release_approval_routes(app,conn,auth):
  def strategy(b:StrategyIn,authorization:str|None=Header(None)):
   auth('vector.approvals.admin',authorization)
   dt=b.document_type.upper()
-  if dt not in {'PR','PO','EXCEPTION'}:raise HTTPException(400,'unsupported_document_type')
+  if dt not in {'PR','PO','EXCEPTION','PAYMENT_RUN'}:raise HTTPException(400,'unsupported_document_type')
   with conn() as c:
    return c.execute("""INSERT INTO vector_release_strategies VALUES(%s,%s,%s,%s,%s,%s)
     ON CONFLICT(code) DO UPDATE SET document_type=EXCLUDED.document_type,min_amount=EXCLUDED.min_amount,

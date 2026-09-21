@@ -54,6 +54,14 @@ def install_acceptance_routes(app,conn,auth):
             except Exception as e:
                 raise HTTPException(500,{'run_id':run_id,'status':'FAIL','error':str(e)})
 
+    @app.get('/v1/acceptance')
+    def acceptance_page():
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse("""<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>VECTOR Acceptance</title>
+<style>body{font-family:-apple-system,system-ui;background:#0b0d10;color:#fff;padding:28px}button{font-size:20px;padding:16px 22px;border:0;border-radius:12px}pre{white-space:pre-wrap;background:#171a20;padding:16px;border-radius:12px}</style>
+<h1>VECTOR Final Acceptance</h1><p>Run the authenticated production integrity checks.</p><button id="run">Run Final Acceptance</button><pre id="out">Ready.</pre>
+<script>document.getElementById('run').onclick=async()=>{let o=document.getElementById('out');o.textContent='Running…';try{let r=await fetch('/v1/acceptance/run',{method:'POST',credentials:'include'});let t=await r.text();try{t=JSON.stringify(JSON.parse(t),null,2)}catch(e){}o.textContent='HTTP '+r.status+'\n'+t}catch(e){o.textContent='Request failed: '+e}}</script>""")
+
     @app.delete('/v1/acceptance/purge')
     def purge_acceptance(authorization:str|None=Header(None)):
         auth('vector.admin',authorization)

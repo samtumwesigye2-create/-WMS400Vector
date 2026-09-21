@@ -26,6 +26,53 @@ def init_accounting(conn):
    c.execute("""INSERT INTO vector_gl_accounts(id,code,name,account_type,active,created_at) VALUES(%s,%s,%s,%s,TRUE,%s)
     ON CONFLICT(code) DO NOTHING""",(str(uuid4()),code,name,typ,now()))
 
+
+def auto_post(c,source_type,source_id,description,lines,actor='system',entry_date=None):
+ existing=c.execute("SELECT * FROM vector_journal_entries WHERE source_type=%s AND source_id=%s AND status='posted'",(source_type,str(source_id))).fetchone()
+ if existing:return existing
+ debit=sum((Decimal(str(x.get('debit',0))) for x in lines),Decimal('0'))
+ credit=sum((Decimal(str(x.get('credit',0))) for x in lines),Decimal('0'))
+ if debit<=0 or debit!=credit:raise HTTPException(409,'automatic_journal_not_balanced')
+ codes=[x['account_code'] for x in lines]
+ found={r['code'] for r in c.execute("SELECT code FROM vector_gl_accounts WHERE active=TRUE AND code=ANY(%s)",(codes,)).fetchall()}
+ if len(found)!=len(set(codes)):raise HTTPException(409,'automatic_gl_account_missing')
+ jid=str(uuid4());jno='JRN-'+now().strftime('%Y%m%d%H%M%S%f')
+ row=c.execute("""INSERT INTO vector_journal_entries VALUES(%s,%s,COALESCE(%s,CURRENT_DATE),%s,%s,%s,'posted',%s,%s,%s,NULL) RETURNING *""",
+  (jid,jno,entry_date,description,source_type,str(source_id),str(actor),now(),now())).fetchone()
+ for x in lines:
+  c.execute("""INSERT INTO vector_journal_lines VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+   (str(uuid4()),jid,x['account_code'],Decimal(str(x.get('debit',0))),Decimal(str(x.get('credit',0))),x.get('memo',''),
+    x.get('po_id'),x.get('invoice_id'),x.get('payment_id')))
+ return row
+
+def post_supplier_invoice(c,invoice,actor='system'):
+ amount=Decimal(str(invoice['amount']))
+ return auto_post(c,'SUPPLIER_INVOICE',invoice['id'],'Supplier invoice '+invoice['invoice_no'],[
+  {'account_code':'5000','debit':amount,'invoice_id':invoice['id'],'po_id':invoice['po_id']},
+  {'account_code':'2000','credit':amount,'invoice_id':invoice['id'],'po_id':invoice['po_id']}],actor,invoice.get('invoice_date'))
+
+def post_supplier_payment(c,payment,actor='system'):
+ amount=Decimal(str(payment['amount']))
+ return auto_post(c,'SUPPLIER_PAYMENT',payment['id'],'Supplier payment '+payment['payment_no'],[
+  {'account_code':'2000','debit':amount,'invoice_id':payment['invoice_id'],'po_id':payment['po_id'],'payment_id':payment['id']},
+  {'account_code':'1000','credit':amount,'invoice_id':payment['invoice_id'],'po_id':payment['po_id'],'payment_id':payment['id']}],actor)
+
+def post_supplier_adjustment(c,adjustment,actor='system'):
+ amount=Decimal(str(adjustment['amount']))
+ if adjustment['adjustment_type']=='credit_memo':
+  lines=[{'account_code':'2000','debit':amount,'invoice_id':adjustment['invoice_id'],'po_id':adjustment['po_id']},
+         {'account_code':'5000','credit':amount,'invoice_id':adjustment['invoice_id'],'po_id':adjustment['po_id']}]
+ else:
+  lines=[{'account_code':'5000','debit':amount,'invoice_id':adjustment['invoice_id'],'po_id':adjustment['po_id']},
+         {'account_code':'2000','credit':amount,'invoice_id':adjustment['invoice_id'],'po_id':adjustment['po_id']}]
+ return auto_post(c,'SUPPLIER_ADJUSTMENT',adjustment['id'],'Supplier '+adjustment['adjustment_type']+' '+adjustment['adjustment_no'],lines,actor)
+
+def post_payment_reversal(c,reversal,payment,actor='system'):
+ amount=Decimal(str(reversal['amount']))
+ return auto_post(c,'PAYMENT_REVERSAL',reversal['id'],'Payment reversal '+reversal['reversal_no'],[
+  {'account_code':'1000','debit':amount,'invoice_id':payment['invoice_id'],'po_id':payment['po_id'],'payment_id':payment['id']},
+  {'account_code':'2000','credit':amount,'invoice_id':payment['invoice_id'],'po_id':payment['po_id'],'payment_id':payment['id']}],actor)
+
 class AccountIn(BaseModel):
  code:str;name:str;account_type:str
 class LineIn(BaseModel):

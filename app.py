@@ -10,7 +10,7 @@ from valuation_audit import init_valuation_audit, install_valuation_audit_routes
 from traceability import init_traceability, install_traceability_routes
 from integration_events import inventory_changed
 from manufacturing_planning import init_manufacturing, install_manufacturing_routes
-from capacity_planning import install_crp_routes
+from capacity_planning import init_capacity_planning, install_crp_routes
 from transportation_management import init_transportation, install_transportation_routes
 from enterprise_suite import init_enterprise_suite, install_enterprise_suite_routes
 from advanced_operations import init_advanced_ops, install_advanced_ops_routes
@@ -68,6 +68,7 @@ def init_db():
  init_valuation_audit(conn)
  init_traceability(conn)
  init_manufacturing(conn)
+ init_capacity_planning(conn)
  init_transportation(conn)
  init_enterprise_suite(conn)
  init_advanced_ops(conn)
@@ -97,7 +98,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS_BASE_URL}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS_BASE_URL}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','inventory-valuation','immutable-audit-ledger','midas-outbox','batch-lot-tracking','serial-tracking','expiration-tracking','traceability','recalls','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','janus-bearer-auth','bom','mps','mrp','work-centers','routings','capacity-planning','production-orders','mto','mts','production-confirmation','scrap-tracking','crp','capacity-gap-analysis','transport-lanes','carrier-management','freight-costing','shipment-planning','carrier-tendering','shipment-execution','tracking-events','transport-kpis','demand-planning','forecast-accuracy','sop-ibp','atp','ctp','multi-level-mrp','mrp-pegging','supplier-management','procure-to-pay-foundation','quality-inspection','warehouse-tasking','abc-classification','returns-reverse-logistics','control-tower','scenario-planning','cost-to-serve','genealogy','sustainability','planning-alerts','finite-capacity-scheduling','shift-calendars','downtime','shopfloor-execution','wip','nonconformance','capa','transport-exceptions','carrier-performance','load-consolidation','route-sequencing','inventory-simulation','replenishment','slotting','maintenance-capacity-impact','automation-recommendations','inventory-ageing','ageing-buckets','fefo','shelf-life-monitoring','slow-moving-stock','warehouse-layout-design','warehouse-zones','warehouse-paths','multi-temperature-layout','cross-dock-layout','asrs-layout','amr-layout','expected-receipts','partial-receipts','receipt-discrepancies','quarantine-release','fulfillment-task-chain','allocation','picking','packing','staging']}
+def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','inventory-valuation','immutable-audit-ledger','midas-outbox','batch-lot-tracking','serial-tracking','expiration-tracking','traceability','recalls','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','janus-bearer-auth','bom','mps','mrp','work-centers','routings','capacity-planning','production-orders','mto','mts','production-confirmation','scrap-tracking','crp','capacity-gap-analysis','capacity-calendars','labor-capacity','machine-capacity','setup-time-capacity','bottleneck-detection','feasible-production-planning','transport-lanes','carrier-management','freight-costing','shipment-planning','carrier-tendering','shipment-execution','tracking-events','transport-kpis','demand-planning','forecast-accuracy','sop-ibp','atp','ctp','multi-level-mrp','mrp-pegging','supplier-management','procure-to-pay-foundation','quality-inspection','warehouse-tasking','abc-classification','returns-reverse-logistics','control-tower','scenario-planning','cost-to-serve','genealogy','sustainability','planning-alerts','finite-capacity-scheduling','shift-calendars','downtime','shopfloor-execution','wip','nonconformance','capa','transport-exceptions','carrier-performance','load-consolidation','route-sequencing','inventory-simulation','replenishment','slotting','maintenance-capacity-impact','automation-recommendations','inventory-ageing','ageing-buckets','fefo','shelf-life-monitoring','slow-moving-stock','warehouse-layout-design','warehouse-zones','warehouse-paths','multi-temperature-layout','cross-dock-layout','asrs-layout','amr-layout','expected-receipts','partial-receipts','receipt-discrepancies','quarantine-release','fulfillment-task-chain','allocation','picking','packing','staging']}
 @app.get('/v1/locations')
 def locations(authorization:str|None=Header(None)):
  auth('vector.locations.read',authorization)

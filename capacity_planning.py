@@ -97,6 +97,11 @@ def install_crp_routes(app, conn, auth):
                 if configured<=0:
                     configured=float(wc['capacity_per_day'])*b.horizon_days if wc else 0.0
                 labor=float(cal['labor'])
+                if labor<=0:
+                    wf=c.execute("""SELECT COALESCE(SUM((end_hour-start_hour)*jsonb_array_length(assigned_workers)),0) labor
+                      FROM vector_workforce_shifts WHERE work_center=%s AND work_date BETWEEN %s AND %s
+                      AND status='scheduled'""",(op['work_center'],start,end)).fetchone()
+                    labor=float(wf['labor']) if wf else 0.0
                 machine=float(cal['machine'])
                 constraints=[x for x in [configured,labor if labor>0 else configured,machine if machine>0 else configured] if x>=0]
                 available=min(constraints) if constraints else 0.0

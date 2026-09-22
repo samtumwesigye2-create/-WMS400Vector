@@ -63,7 +63,7 @@ def install_acceptance_routes(app,conn,auth):
                   'vector_production_orders','vector_demand_forecasts','vector_sop_plans','vector_suppliers',
                   'vector_purchase_orders','vector_quality_inspections','vector_warehouse_tasks',
                   'vector_shipments','vector_returns','vector_sustainability_metrics','vector_shopfloor_events',
-                  'vector_nonconformance','vector_transport_exceptions']
+                  'vector_nonconformance','vector_transport_exceptions','vector_capacity_calendar','vector_setup_times']
                 for t in tables:
                     exists=c.execute('SELECT to_regclass(%s) r',(t,)).fetchone()['r']
                     checks.append({'stage':t,'status':'PASS' if exists else 'FAIL'})

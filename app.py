@@ -27,6 +27,7 @@ from release_approvals import init_release_approvals, install_release_approval_r
 from inbound_workflow import init_inbound_workflow, install_inbound_workflow_routes
 from bom_governance import init_bom_governance, install_bom_governance_routes
 from workforce_capacity import init_workforce_capacity, install_workforce_capacity_routes
+from simple_ops import install_simple_ops_routes
 
 app=FastAPI(title='UNG-VECTOR',version='0.29.2')
 DB=os.getenv('DATABASE_URL','')
@@ -189,6 +190,7 @@ install_demand_classification_routes(app, conn, auth)
 install_inbound_workflow_routes(app, conn, auth, emit)
 install_bom_governance_routes(app, conn, auth)
 install_workforce_capacity_routes(app, conn, auth)
+install_simple_ops_routes(app, conn, auth)
 
 from pathlib import Path
 from ui_portal import install_ui

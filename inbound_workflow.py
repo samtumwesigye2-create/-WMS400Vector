@@ -196,6 +196,41 @@ def install_inbound_workflow_routes(app,conn,auth,emit=None):
                 c.execute('UPDATE vector_inventory_status SET reserved=GREATEST(0,reserved-%s),updated_at=%s WHERE sku=%s AND location_code=%s',(task['quantity'],t,task['sku'],task['source_location']))
         return row
 
+    @router.post('/fulfillment/{reference}/next')
+    def complete_next_fulfillment_step(reference:str,authorization:str|None=Header(None)):
+        auth('vector.warehouse.write',authorization)
+        t=now()
+        with conn() as c:
+            tasks=c.execute('SELECT * FROM vector_fulfillment_tasks WHERE reference=%s ORDER BY sequence_no FOR UPDATE',(reference,)).fetchall()
+            if not tasks: raise HTTPException(404,'fulfillment_not_found')
+            task=next((x for x in tasks if x['status']!='completed'),None)
+            if not task:
+                return {'reference':reference,'status':'complete','message':'Fulfillment already complete','tasks':tasks}
+            if task['status']=='cancelled': raise HTTPException(409,'next_task_cancelled')
+            if task['sequence_no']>1:
+                prior=next((x for x in tasks if x['sequence_no']==task['sequence_no']-1),None)
+                if not prior or prior['status']!='completed': raise HTTPException(409,'prior_task_not_completed')
+            row=c.execute('UPDATE vector_fulfillment_tasks SET status=%s,updated_at=%s WHERE id=%s RETURNING *',
+                          ('completed',t,task['id'])).fetchone()
+            if task['task_type']=='allocate':
+                c.execute("""INSERT INTO vector_inventory_status(sku,location_code,reserved,quarantine,damaged,updated_at)
+                  VALUES(%s,%s,%s,0,0,%s)
+                  ON CONFLICT(sku,location_code) DO UPDATE SET reserved=vector_inventory_status.reserved+EXCLUDED.reserved,updated_at=EXCLUDED.updated_at""",
+                  (task['sku'],task['source_location'],task['quantity'],t))
+            if task['task_type']=='stage':
+                inv=_ensure_inventory(c,task['sku'],task['source_location'])
+                if float(inv['quantity'])<float(task['quantity']): raise HTTPException(409,'insufficient_inventory')
+                c.execute('UPDATE vector_inventory SET quantity=quantity-%s,updated_at=%s WHERE id=%s',
+                          (task['quantity'],t,inv['id']))
+                c.execute('UPDATE vector_inventory_status SET reserved=GREATEST(0,reserved-%s),updated_at=%s WHERE sku=%s AND location_code=%s',
+                          (task['quantity'],t,task['sku'],task['source_location']))
+            remaining=c.execute("""SELECT * FROM vector_fulfillment_tasks WHERE reference=%s
+              ORDER BY sequence_no""",(reference,)).fetchall()
+        next_task=next((x for x in remaining if x['status']!='completed'),None)
+        return {'reference':reference,'completed_step':row['task_type'],
+                'next_step':next_task['task_type'] if next_task else None,
+                'status':'complete' if not next_task else 'in_progress','tasks':remaining}
+
     @router.get('/fulfillment/{reference}')
     def fulfillment(reference:str,authorization:str|None=Header(None)):
         auth('vector.warehouse.read',authorization)

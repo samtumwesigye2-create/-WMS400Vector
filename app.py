@@ -1,3 +1,4 @@
+from ung_shared.system_adapter import register_frame, convert_position, link_timing
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timezone
@@ -199,3 +200,13 @@ from accounting import init_accounting,install_accounting_routes
 install_ui(app, Path(__file__).with_name('ui') / 'index.html', JANUS_BASE_URL)
 
 install_digital_twin_routes(app)
+
+@app.post("/v1/frames/register")
+def ung_frame_register(body: dict):
+    return register_frame(body["source"],body["destination"],body["matrix"],body.get("timestamp"),body.get("version","ung-frame-v1"))
+@app.post("/v1/frames/convert")
+def ung_frame_convert(body: dict):
+    return convert_position(body["position"],body["source"],body["destination"])
+@app.post("/v1/propagation/link")
+def ung_propagation_link(body: dict):
+    return link_timing(body["origin_m"],body["destination_m"],float(body.get("speed_mps",299792458.0)))

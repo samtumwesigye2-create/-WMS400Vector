@@ -194,5 +194,8 @@ install_simple_ops_routes(app, conn, auth)
 
 from pathlib import Path
 from ui_portal import install_ui
+from digital_twin import install_digital_twin_routes
 from accounting import init_accounting,install_accounting_routes
 install_ui(app, Path(__file__).with_name('ui') / 'index.html', JANUS_BASE_URL)
+
+install_digital_twin_routes(app)

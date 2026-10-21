@@ -8,29 +8,6 @@ from psycopg.rows import dict_row
 from material_master import init_material_master, install_material_routes
 from inventory_control import init_inventory_control, install_inventory_control_routes
 from valuation_audit import init_valuation_audit, install_valuation_audit_routes
-from traceability import init_traceability, install_traceability_routes
-from integration_events import inventory_changed
-from manufacturing_planning import init_manufacturing, install_manufacturing_routes
-from capacity_planning import init_capacity_planning, install_crp_routes
-from transportation_management import init_transportation, install_transportation_routes
-from enterprise_suite import init_enterprise_suite, install_enterprise_suite_routes
-from advanced_operations import init_advanced_ops, install_advanced_ops_routes
-from acceptance_test import install_acceptance_routes
-from inventory_ageing import init_inventory_ageing, install_inventory_ageing_routes
-from warehouse_layout import init_warehouse_layout, install_warehouse_layout_routes
-from enterprise_structure import init_enterprise_structure, install_enterprise_structure_routes
-from mrp_areas import init_mrp_areas, install_mrp_area_routes
-from supply_chain_kpis import init_supply_chain_kpis, install_supply_chain_kpi_routes
-from goods_movement import init_goods_movement, install_goods_movement_routes
-from mm_transactions import init_mm_transactions, install_mm_transaction_routes
-from demand_classification import install_demand_classification_routes
-from release_approvals import init_release_approvals, install_release_approval_routes
-from inbound_workflow import init_inbound_workflow, install_inbound_workflow_routes
-from bom_governance import init_bom_governance, install_bom_governance_routes
-from workforce_capacity import init_workforce_capacity, install_workforce_capacity_routes
-from simple_ops import install_simple_ops_routes
-
-app=FastAPI(title='UNG-VECTOR',version='0.29.2')
 DB=os.getenv('DATABASE_URL','')
 JANUS_BASE_URL=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
 NEXUS_BASE_URL=os.getenv('NEXUS_BASE_URL','https://ung-nexus-production.up.railway.app').rstrip('/')
@@ -70,33 +47,13 @@ def init_db():
  init_material_master(conn)
  init_inventory_control(conn)
  init_valuation_audit(conn)
- init_traceability(conn)
- init_manufacturing(conn)
- init_capacity_planning(conn)
- init_transportation(conn)
- init_enterprise_suite(conn)
- init_advanced_ops(conn)
- init_inventory_ageing(conn)
- init_warehouse_layout(conn)
- init_enterprise_structure(conn)
- init_mrp_areas(conn)
- init_supply_chain_kpis(conn)
- init_goods_movement(conn)
- init_mm_transactions(conn)
- init_release_approvals(conn)
- init_inbound_workflow(conn)
- init_bom_governance(conn)
- init_workforce_capacity(conn)
- init_accounting(conn)
+
 @app.on_event('startup')
 def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
 class InventoryIn(BaseModel):sku:str;description:str;quantity:int;location_code:str
 class MovementIn(BaseModel):sku:str;quantity:int;movement_type:str;from_location:str|None=None;to_location:str|None=None;reference:str|None=None
-@app.get('/api/status')
-def root():return {'system':'UNG-VECTOR','domain':'warehouse-logistics','status':'online','version':'0.29.2'}
-@app.get('/health')
-def health():return {'status':'ok','service':'UNG-VECTOR','version':'0.29.2'}
+
 @app.get('/ready')
 def ready():
  try:
@@ -104,7 +61,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS_BASE_URL}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS_BASE_URL}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','inventory-valuation','immutable-audit-ledger','midas-outbox','batch-lot-tracking','serial-tracking','expiration-tracking','traceability','recalls','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','janus-bearer-auth','bom','mps','mrp','work-centers','routings','capacity-planning','production-orders','mto','mts','production-confirmation','scrap-tracking','crp','capacity-gap-analysis','capacity-calendars','labor-capacity','machine-capacity','setup-time-capacity','bottleneck-detection','feasible-production-planning','transport-lanes','carrier-management','freight-costing','shipment-planning','carrier-tendering','shipment-execution','tracking-events','transport-kpis','demand-planning','forecast-accuracy','sop-ibp','atp','ctp','multi-level-mrp','mrp-pegging','supplier-management','procure-to-pay-foundation','quality-inspection','warehouse-tasking','abc-classification','returns-reverse-logistics','control-tower','scenario-planning','cost-to-serve','genealogy','sustainability','planning-alerts','finite-capacity-scheduling','shift-calendars','downtime','shopfloor-execution','wip','nonconformance','capa','transport-exceptions','carrier-performance','load-consolidation','route-sequencing','inventory-simulation','replenishment','slotting','maintenance-capacity-impact','automation-recommendations','inventory-ageing','ageing-buckets','fefo','shelf-life-monitoring','slow-moving-stock','warehouse-layout-design','warehouse-zones','warehouse-paths','multi-temperature-layout','cross-dock-layout','asrs-layout','amr-layout','expected-receipts','partial-receipts','receipt-discrepancies','quarantine-release','fulfillment-task-chain','allocation','picking','packing','staging','ebom','mbom','sales-bom','bom-conversion','bom-audit','bom-version-governance','workforce-capacity','skills-matrix','shift-planning','labor-availability','skill-gap-detection']}
+
 @app.get('/v1/locations')
 def locations(authorization:str|None=Header(None)):
  auth('vector.locations.read',authorization)
@@ -170,43 +127,4 @@ def summary(authorization:str|None=Header(None)):
  with conn() as c:return {'distinct_skus':c.execute('SELECT count(DISTINCT sku) n FROM vector_inventory').fetchone()['n'],'units_on_hand':c.execute('SELECT COALESCE(sum(quantity),0) n FROM vector_inventory').fetchone()['n'],'movements':c.execute('SELECT count(*) n FROM vector_movements').fetchone()['n'],'generated_at':now()}
 
 install_material_routes(app, conn, auth)
-install_inventory_control_routes(app, conn, auth, emit)
-install_valuation_audit_routes(app, conn, auth)
-install_traceability_routes(app, conn, auth)
-install_manufacturing_routes(app, conn, auth)
-install_crp_routes(app, conn, auth)
-install_transportation_routes(app, conn, auth)
-install_enterprise_suite_routes(app, conn, auth)
-install_advanced_ops_routes(app, conn, auth)
-install_acceptance_routes(app, conn, auth)
-install_inventory_ageing_routes(app, conn, auth)
-install_warehouse_layout_routes(app, conn, auth)
-install_enterprise_structure_routes(app, conn, auth)
-install_mrp_area_routes(app, conn, auth)
-install_supply_chain_kpi_routes(app, conn, auth)
-install_goods_movement_routes(app, conn, auth)
-install_mm_transaction_routes(app, conn, auth)
-install_release_approval_routes(app, conn, auth)
-install_demand_classification_routes(app, conn, auth)
-install_inbound_workflow_routes(app, conn, auth, emit)
-install_bom_governance_routes(app, conn, auth)
-install_workforce_capacity_routes(app, conn, auth)
-install_simple_ops_routes(app, conn, auth)
 
-from pathlib import Path
-from ui_portal import install_ui
-from digital_twin import install_digital_twin_routes
-from accounting import init_accounting,install_accounting_routes
-install_ui(app, Path(__file__).with_name('ui') / 'index.html', JANUS_BASE_URL)
-
-install_digital_twin_routes(app)
-
-@app.post("/v1/frames/register")
-def ung_frame_register(body: dict):
-    return register_frame(body["source"],body["destination"],body["matrix"],body.get("timestamp"),body.get("version","ung-frame-v1"))
-@app.post("/v1/frames/convert")
-def ung_frame_convert(body: dict):
-    return convert_position(body["position"],body["source"],body["destination"])
-@app.post("/v1/propagation/link")
-def ung_propagation_link(body: dict):
-    return link_timing(body["origin_m"],body["destination_m"],float(body.get("speed_mps",299792458.0)))

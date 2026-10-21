@@ -7,7 +7,7 @@ import json, os, psycopg, urllib.error, urllib.request
 from psycopg.rows import dict_row
 from material_master import init_material_master, install_material_routes
 from inventory_control import init_inventory_control, install_inventory_control_routes
-from valuation_audit import init_valuation_audit, install_valuation_audit_routes
+> main
 DB=os.getenv('DATABASE_URL','')
 JANUS_BASE_URL=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
 NEXUS_BASE_URL=os.getenv('NEXUS_BASE_URL','https://ung-nexus-production.up.railway.app').rstrip('/')
@@ -46,14 +46,13 @@ def init_db():
   c.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_vector_inventory_sku_location ON vector_inventory(sku,location_code)')
  init_material_master(conn)
  init_inventory_control(conn)
- init_valuation_audit(conn)
-
+<>>>> main
 @app.on_event('startup')
 def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
 class InventoryIn(BaseModel):sku:str;description:str;quantity:int;location_code:str
 class MovementIn(BaseModel):sku:str;quantity:int;movement_type:str;from_location:str|None=None;to_location:str|None=None;reference:str|None=None
-
+>>>>>> main
 @app.get('/ready')
 def ready():
  try:
@@ -61,7 +60,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS_BASE_URL}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS_BASE_URL}
 @app.get('/v1/system')
-
+>>>> main
 @app.get('/v1/locations')
 def locations(authorization:str|None=Header(None)):
  auth('vector.locations.read',authorization)
@@ -127,4 +126,3 @@ def summary(authorization:str|None=Header(None)):
  with conn() as c:return {'distinct_skus':c.execute('SELECT count(DISTINCT sku) n FROM vector_inventory').fetchone()['n'],'units_on_hand':c.execute('SELECT COALESCE(sum(quantity),0) n FROM vector_inventory').fetchone()['n'],'movements':c.execute('SELECT count(*) n FROM vector_movements').fetchone()['n'],'generated_at':now()}
 
 install_material_routes(app, conn, auth)
-

@@ -45,6 +45,7 @@ def init_db():
   c.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_vector_inventory_sku_location ON vector_inventory(sku,location_code)')
  init_material_master(conn)
  init_inventory_control(conn)
+
 @app.on_event('startup')
 def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
@@ -57,7 +58,6 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS_BASE_URL}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS_BASE_URL}
 @app.get('/v1/system')
->>>> main
 @app.get('/v1/locations')
 def locations(authorization:str|None=Header(None)):
  auth('vector.locations.read',authorization)

@@ -1,3 +1,4 @@
+from ung_shared.system_adapter import register_frame, convert_position, link_timing
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timezone
@@ -6,11 +7,21 @@ import json, os, psycopg, urllib.error, urllib.request
 from psycopg.rows import dict_row
 from material_master import init_material_master, install_material_routes
 from inventory_control import init_inventory_control, install_inventory_control_routes
-
-app=FastAPI(title='UNG-VECTOR',version='0.5.0')
+> main
 DB=os.getenv('DATABASE_URL','')
 JANUS_BASE_URL=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
+NEXUS_BASE_URL=os.getenv('NEXUS_BASE_URL','https://ung-nexus-production.up.railway.app').rstrip('/')
+VECTOR_SERVICE_TOKEN=os.getenv('UNG_VECTOR_SERVICE_TOKEN','').strip()
 def now(): return datetime.now(timezone.utc)
+def emit(target,message_type,payload):
+ if not NEXUS_BASE_URL:return {'status':'disabled'}
+ if not VECTOR_SERVICE_TOKEN:return {'status':'failed','error':'vector_service_token_missing'}
+ body=json.dumps({'source_system':'UNG-VECTOR','target_system':target,'message_type':message_type,'payload':payload}).encode()
+ req=urllib.request.Request(NEXUS_BASE_URL+'/v1/messages',data=body,method='POST',headers={'Authorization':f'Bearer {VECTOR_SERVICE_TOKEN}','Content-Type':'application/json','User-Agent':'UNG-VECTOR/0.29.2'})
+ try:
+  with urllib.request.urlopen(req,timeout=8) as r:return {'status':'delivered','response_code':r.status,'response':json.loads(r.read().decode() or '{}')}
+ except urllib.error.HTTPError as e:return {'status':'failed','response_code':e.code,'error':f'http_{e.code}'}
+ except Exception as e:return {'status':'failed','error':type(e).__name__}
 def auth(permission,authorization):
  if not authorization or not authorization.lower().startswith('bearer '): raise HTTPException(401,'JANUS bearer token required')
  req=urllib.request.Request(JANUS_BASE_URL+'/v1/auth/introspect',data=b'',method='POST',headers={'Authorization':authorization})
@@ -35,15 +46,13 @@ def init_db():
   c.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_vector_inventory_sku_location ON vector_inventory(sku,location_code)')
  init_material_master(conn)
  init_inventory_control(conn)
+<>>>> main
 @app.on_event('startup')
 def startup():init_db()
 class LocationIn(BaseModel):code:str;name:str;location_type:str='warehouse'
 class InventoryIn(BaseModel):sku:str;description:str;quantity:int;location_code:str
 class MovementIn(BaseModel):sku:str;quantity:int;movement_type:str;from_location:str|None=None;to_location:str|None=None;reference:str|None=None
-@app.get('/')
-def root():return {'system':'UNG-VECTOR','domain':'warehouse-logistics','status':'online','version':'0.5.0'}
-@app.get('/health')
-def health():return {'status':'ok','service':'UNG-VECTOR','version':'0.5.0'}
+>>>>>> main
 @app.get('/ready')
 def ready():
  try:
@@ -51,7 +60,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS_BASE_URL}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS_BASE_URL}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-VECTOR','domain':'warehouse-logistics','capabilities':['material-master','inventory-control','reservations','stock-status','stock-in-transit','locations','inventory','receiving','dispatch','transfer','adjustment','transactional-stock','janus-bearer-auth']}
+>>>> main
 @app.get('/v1/locations')
 def locations(authorization:str|None=Header(None)):
  auth('vector.locations.read',authorization)
@@ -97,12 +106,23 @@ def move(b:MovementIn,authorization:str|None=Header(None)):
   else:
    row=c.execute('SELECT id,quantity FROM vector_inventory WHERE sku=%s AND location_code=%s FOR UPDATE',(b.sku,b.from_location)).fetchone()
    if not row:raise HTTPException(404,'inventory_not_found')
+   adjustment_delta=b.quantity-row['quantity']
    c.execute('UPDATE vector_inventory SET quantity=%s,updated_at=%s WHERE id=%s',(b.quantity,now(),row['id']))
-  return c.execute('INSERT INTO vector_movements VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(str(uuid4()),b.sku,b.quantity,b.movement_type,b.from_location,b.to_location,b.reference,now())).fetchone()
+  movement=c.execute('INSERT INTO vector_movements VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(str(uuid4()),b.sku,b.quantity,b.movement_type,b.from_location,b.to_location,b.reference,now())).fetchone()
+ location=b.to_location if b.movement_type=='receive' else b.from_location
+ delta=b.quantity if b.movement_type=='receive' else (-b.quantity if b.movement_type=='dispatch' else 0)
+ events=[]
+ if b.movement_type=='transfer':
+  events=[inventory_changed(b.sku,b.from_location,-b.quantity,'transfer_out',b.reference or ''),inventory_changed(b.sku,b.to_location,b.quantity,'transfer_in',b.reference or '')]
+ elif b.movement_type=='adjust':
+  events=[inventory_changed(b.sku,b.from_location,adjustment_delta,'adjust',b.reference or '')]
+ else:
+  events=[inventory_changed(b.sku,location,delta,b.movement_type,b.reference or '')]
+ deliveries=[emit(e['target_system'],e['message_type'],e['payload']) for e in events]
+ return {'movement':movement,'integration_events':events,'integration_delivery':deliveries}
 @app.get('/v1/summary')
 def summary(authorization:str|None=Header(None)):
  auth('vector.inventory.read',authorization)
  with conn() as c:return {'distinct_skus':c.execute('SELECT count(DISTINCT sku) n FROM vector_inventory').fetchone()['n'],'units_on_hand':c.execute('SELECT COALESCE(sum(quantity),0) n FROM vector_inventory').fetchone()['n'],'movements':c.execute('SELECT count(*) n FROM vector_movements').fetchone()['n'],'generated_at':now()}
 
 install_material_routes(app, conn, auth)
-install_inventory_control_routes(app, conn, auth)

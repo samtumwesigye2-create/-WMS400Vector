@@ -79,7 +79,7 @@ def _available(inv, stat):
     return inv['quantity'] - stat['reserved'] - stat['quarantine'] - stat['damaged']
 
 
-def install_inventory_control_routes(app, conn, auth):
+
     @router.get('/balances')
     def balances(authorization: str | None = Header(None)):
         auth('vector.inventory.read', authorization)
@@ -112,9 +112,7 @@ def install_inventory_control_routes(app, conn, auth):
             c.execute('UPDATE vector_inventory_status SET reserved=reserved+%s,updated_at=%s WHERE sku=%s AND location_code=%s',
                       (b.quantity,t,b.sku,b.location_code))
             try:
-                return c.execute('''INSERT INTO vector_reservations
-                  VALUES(%s,%s,%s,%s,%s,'active',%s,%s,%s) RETURNING *''',
-                  (str(uuid4()),b.reservation_code,b.sku,b.location_code,b.quantity,b.reference,t,t)).fetchone()
+main
             except Exception as e:
                 if 'unique' in str(e).lower(): raise HTTPException(409,'reservation_already_exists')
                 raise
@@ -137,8 +135,7 @@ def install_inventory_control_routes(app, conn, auth):
                 if inv['quantity'] < r['quantity']: raise HTTPException(409,'insufficient_inventory')
                 c.execute('UPDATE vector_inventory SET quantity=quantity-%s,updated_at=%s WHERE id=%s',
                           (r['quantity'],t,inv['id']))
-            return c.execute('UPDATE vector_reservations SET status=%s,updated_at=%s WHERE id=%s RETURNING *',
-                             ('consumed' if b.action=='consume' else 'released',t,r['id'])).fetchone()
+
 
     @router.post('/stock-status', status_code=201)
     def change_stock_status(b: StockStatusChange, authorization: str | None = Header(None)):
@@ -160,7 +157,7 @@ def install_inventory_control_routes(app, conn, auth):
                 c.execute(f'UPDATE vector_inventory_status SET {source}={source}-%s,updated_at=%s WHERE sku=%s AND location_code=%s',
                           (b.quantity,t,b.sku,b.location_code))
             row=c.execute('SELECT * FROM vector_inventory_status WHERE sku=%s AND location_code=%s',(b.sku,b.location_code)).fetchone()
-            return {'sku':b.sku,'location_code':b.location_code,'status':row,'reference':b.reference}
+
 
     @router.get('/transit')
     def transit_list(authorization: str | None = Header(None)):
@@ -181,9 +178,7 @@ def install_inventory_control_routes(app, conn, auth):
             t=now()
             c.execute('UPDATE vector_inventory SET quantity=quantity-%s,updated_at=%s WHERE id=%s',(b.quantity,t,inv['id']))
             try:
-                return c.execute('''INSERT INTO vector_stock_transit
-                  VALUES(%s,%s,%s,%s,%s,%s,'in_transit',%s,%s,%s) RETURNING *''',
-                  (str(uuid4()),b.transit_code,b.sku,b.quantity,b.from_location,b.to_location,b.reference,t,t)).fetchone()
+
             except Exception as e:
                 if 'unique' in str(e).lower(): raise HTTPException(409,'transit_already_exists')
                 raise
@@ -203,7 +198,5 @@ def install_inventory_control_routes(app, conn, auth):
             c.execute("""INSERT INTO vector_inventory VALUES(%s,%s,%s,%s,%s,'available',%s)
               ON CONFLICT(sku,location_code) DO UPDATE SET quantity=vector_inventory.quantity+EXCLUDED.quantity,updated_at=EXCLUDED.updated_at""",
               (str(uuid4()),tr['sku'],desc,tr['quantity'],target,t))
-            return c.execute('UPDATE vector_stock_transit SET status=%s,updated_at=%s WHERE id=%s RETURNING *',
-                             ('received' if b.action=='receive' else 'cancelled',t,tr['id'])).fetchone()
 
     app.include_router(router)
